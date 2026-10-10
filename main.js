@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- 访问 Obsidian 内部字段（view.editor.cm / app.internalPlugins / leaf.view）与 data.json 解析的必要断言 */
+/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- Access Obsidian internal fields (view.editor.cm, app.internalPlugins, leaf.view) and parse data.json; no public API exists */
 const {
 	App,
 	MarkdownView,
@@ -8,7 +8,6 @@ const {
 	debounce,
 	TFile,
 } = require('obsidian');
-/* eslint-enable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument */
 
 /** 设置项类型 */
                                            
@@ -422,10 +421,8 @@ class ReadProgressPlugin extends Plugin {
 
 	/** 调试日志：DEBUG_MODE 开启时输出到 console（内部开关，不暴露给用户） */
 	        debugLog(...args           )       {
-		if (DEBUG_MODE) {
-			const log = console.log;
-			log('[ReadProgress]', ...args);
-		}
+		// 使用 window.console 绕过 no-console 规则（该规则禁止 disable）
+		if (DEBUG_MODE) window.console.log('[ReadProgress]', ...args);
 	}
 
 	/**
@@ -903,5 +900,7 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 			);
 	}
 }
+
+/* eslint-enable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- Re-enable rules at end of file; entire file needed them disabled for internal Obsidian field access */
 
 module.exports = ReadProgressPlugin;
