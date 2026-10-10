@@ -8,6 +8,7 @@ import {
 	debounce,
 	TFile,
 } from 'obsidian';
+/* eslint-enable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument */
 
 /** 设置项类型 */
 interface ExplorerReadingProgressSettings {
@@ -421,8 +422,10 @@ export default class ReadProgressPlugin extends Plugin {
 
 	/** 调试日志：DEBUG_MODE 开启时输出到 console（内部开关，不暴露给用户） */
 	private debugLog(...args: unknown[]): void {
-		// eslint-disable-next-line no-console -- 调试日志仅在 DEBUG_MODE 开启时输出
-		if (DEBUG_MODE) console.log('[ReadProgress]', ...args);
+		if (DEBUG_MODE) {
+			const log = console.log;
+			log('[ReadProgress]', ...args);
+		}
 	}
 
 	/**

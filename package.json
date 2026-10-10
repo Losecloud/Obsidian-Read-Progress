@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-read-progress",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Renders a reading progress bar below each markdown note in the file explorer (progress stored in data.json).",
 	"main": "main.js",
 	"scripts": {
