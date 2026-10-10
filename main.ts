@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- 访问 Obsidian 内部字段（view.editor.cm / app.internalPlugins / leaf.view）与 data.json 解析的必要断言 */
 import {
 	App,
 	MarkdownView,
@@ -420,6 +421,7 @@ export default class ReadProgressPlugin extends Plugin {
 
 	/** 调试日志：DEBUG_MODE 开启时输出到 console（内部开关，不暴露给用户） */
 	private debugLog(...args: unknown[]): void {
+		// eslint-disable-next-line no-console -- 调试日志仅在 DEBUG_MODE 开启时输出
 		if (DEBUG_MODE) console.log('[ReadProgress]', ...args);
 	}
 
@@ -610,7 +612,7 @@ export default class ReadProgressPlugin extends Plugin {
 		const host = titleEl;
 
 		// 已存在则更新，否则新建
-		let container = host.querySelector(':scope > .explorer-reading-progress-container') as HTMLElement | null;
+		let container = host.querySelector<HTMLElement>(':scope > .explorer-reading-progress-container');
 		if (!container) {
 			container = host.createDiv({ cls: 'explorer-reading-progress-container' });
 		}
@@ -717,7 +719,7 @@ export default class ReadProgressPlugin extends Plugin {
 				};
 			} else if (value && typeof value === 'object' && Array.isArray((value as { buckets?: unknown }).buckets)) {
 				// 新版桶模型：直接使用
-				this.progressData[path] = value as NoteProgress;
+				this.progressData[path] = value;
 			}
 		}
 	}
@@ -780,7 +782,7 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 			// 注意：滚动位置记录/恢复方法定义在 Plugin 类上，需通过 this.plugin 调用
 			this.app.setting.openTabById('community-plugins');
 			// DOM 渲染完成后恢复滚动位置
-			setTimeout(() => this.plugin.restoreCommunityPluginsScroll(), 50);
+			window.setTimeout(() => this.plugin.restoreCommunityPluginsScroll(), 50);
 		};
 
 		// Time Counting Mode (Beta)：覆盖模型开关（置于顶部）

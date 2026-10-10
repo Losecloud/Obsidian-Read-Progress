@@ -1,7 +1,7 @@
 {
 	"id": "read-progress",
 	"name": "Read Progress",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "1.5.0",
 	"description": "Renders a reading progress bar below each markdown note in the file explorer.",
 	"author": "Read Progress",
