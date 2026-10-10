@@ -1,0 +1,90 @@
+/* Explorer Reading Progress — 文件资源管理器中的阅读进度条
+ *
+ * 布局机制（对标 Files Progress）：
+ *  - 进度条容器绝对定位在 .nav-file-title-content 底部（bottom: -offset），
+ *    不进入文档流，因此不挤开“阅读 / 文件大小”等行内信息，也不增加条目高度。
+ *  - 进度条用 div 实现（轨道 + 填充），尺寸完全可控，不受原生 progress 默认样式影响。
+ */
+
+/* 条目容器：允许进度条超出条目边界显示，避免被 padding/overflow 吞掉
+ * 注意：.nav-file-title-content 保持 Obsidian 默认样式（overflow: hidden + ellipsis），
+ * 以保证文件名随右侧元信息自动折叠截断，不可覆盖 */
+.nav-file-title {
+	position: relative;
+	overflow: visible;
+}
+
+/* 进度条容器：绝对定位覆盖在内容底部，不占布局空间
+ * bottom 为负值实现下移偏移（由 --erp-bar-offset 控制，默认 5px） */
+.explorer-reading-progress-container {
+	position: absolute;
+	left: 0;
+	bottom: calc(-1 * var(--erp-bar-offset, 5px));
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	gap: var(--size-2-1, 4px);
+	pointer-events: none;
+}
+
+/* 进度条轨道：尺寸由 CSS 变量控制（JS 写入 --erp-bar-width / --erp-line-width） */
+.explorer-reading-progress-bar {
+	box-sizing: border-box;
+	position: relative;
+	display: block;
+	flex: 0 0 auto;
+	width: var(--erp-bar-width, 90px);
+	height: var(--erp-line-width, 2px);
+	border: none;
+	border-radius: 0;
+	padding: 0;
+	margin: 0;
+	/* 轨道：主题变量（自适应亮/暗色，约 12% 透明，同 Files Progress） */
+	background-color: var(--background-modifier-border-hover, rgba(128, 128, 128, 0.12));
+	overflow: hidden;
+}
+
+/* 进度条填充：宽度按百分比设置
+ * shape-rendering: crispEdges → 消除 120% 缩放下的子像素抗锯齿差异 */
+.explorer-reading-progress-fill {
+	box-sizing: border-box;
+	position: absolute;
+	left: 0;
+	top: 0;
+	height: 100%;
+	width: 0%;
+	border-radius: 0;
+	background-color: var(--text-accent, var(--interactive-accent));
+	shape-rendering: crispEdges;
+	transition: width 200ms ease;
+}
+
+/* 完成态：进度达到 100% 时变绿 */
+.explorer-reading-progress-fill.is-complete {
+	background-color: var(--color-green, #4caf50);
+}
+
+/* 全圆角模式：仅轨道两端圆角。
+ * fill 段保持方角（bar 的 overflow:hidden 会裁剪 fill 两端形成圆角），
+ * 避免每个 fill 段各自圆角在相邻段相接处产生割裂段差 */
+body.erp-rounded .explorer-reading-progress-bar {
+	border-radius: 999px;
+}
+
+/* 百分比文字：10px，灰色 */
+.explorer-reading-progress-text {
+	font-size: 10px;
+	line-height: 1;
+	color: var(--text-faint, rgba(128, 128, 128, 0.7));
+	white-space: nowrap;
+}
+
+/* 设置页排版：Back 按钮下方留 gap */
+.mod-back {
+	margin-bottom: 10px;
+}
+
+/* 设置页排版：缩放说明下方留 30px，区隔上下选项 */
+.erp-note {
+	margin-bottom: 30px;
+}
