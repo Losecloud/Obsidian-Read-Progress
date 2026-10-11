@@ -2,11 +2,23 @@
 
 Renders a reading progress bar below each markdown note in the Obsidian file explorer.
 
+## Screenshots
+
+English example:
+
+![English example](https://raw.githubusercontent.com/Losecloud/Obsidian-Read-Progress/main/images/English_example.png)
+
+Chinese example:
+
+![Chinese example](https://raw.githubusercontent.com/Losecloud/Obsidian-Read-Progress/main/images/Chinese_example.png)
+
 ## Features
 
-- **Per-note progress bar**: a thin bar under every `.md` entry in the file explorer, aligned under the note title.
+- **Per-note progress bar**: a thin bar under every `.md` and `.pdf` entry in the file explorer, aligned under the note title.
+- **PDF reading support**: tracks reading position and time for PDFs (continuous scroll and single-page modes), including zoom boundary handling.
 - **Time Counting Mode (Beta)**: tracks the regions you actually read instead of the cursor position. Re-read areas appear denser; quick scans stay faint. Density scales with reading time up to your goal, then turns into the complete color.
 - **Reading time tracking**: WeChat-Read-style timer. Pauses when the window is unfocused, a modal is open, or you scroll away; caps a single region after 5 minutes of idle.
+- **Info display**: show Read Time, Est. Time, Last Read date, or Read Progress % at the right side of each file (compatible with Novel word count).
 - **Progress stored in `data.json`**: no frontmatter changes to your notes.
 
 ## Usage
@@ -21,12 +33,15 @@ Renders a reading progress bar below each markdown note in the Obsidian file exp
 | Setting | Description |
 | --- | --- |
 | Time Counting Mode (Beta) | Track actually read regions with time instead of the cursor position |
-| How long do you prefer reading? | Reading goal in minutes (e.g. 120 = 2h) |
+| How long do you prefer reading? | Reading goal in minutes (e.g. 5 = 5min) |
 | Bar width | Width of the progress bar in the file explorer (px) |
 | Line width | Thickness (height) of the progress bar line (px) |
 | Rounded corners | Fully rounded (pill-shaped) progress bar ends |
 | Vertical offset | Distance the bar moves down from the note title (px) |
-| Green on complete | Turn the bar green when the reading goal is reached |
+| Pending color | Fill color while reading is in progress (empty = system accent color) |
+| Complete color | Fill color when the reading goal is reached (empty = green) |
+| 1st / 2nd / 3rd Info Display | Extra info at the right side of each file: Read Time, Est. Time, Last Read, Read Progress (slots are exclusive) |
+| Restore Markdown Position | Remember the last reading position of each note and restore it when reopening |
 
 ## Notes
 
