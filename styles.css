@@ -59,9 +59,10 @@
 	transition: width 200ms ease;
 }
 
-/* 完成态：进度达到 100% 时变绿 */
+/* 完成态：进度达到 100% 时变绿（固定绿色，
+ * 避免浅色主题 --color-green 解析为深黑色） */
 .explorer-reading-progress-fill.is-complete {
-	background-color: var(--color-green, #4caf50);
+	background-color: #4caf50;
 }
 
 /* 全圆角模式：仅轨道两端圆角。
@@ -69,6 +70,44 @@
  * 避免每个 fill 段各自圆角在相邻段相接处产生割裂段差 */
 body.erp-rounded .explorer-reading-progress-bar {
 	border-radius: 999px;
+}
+
+/* 信息显示：data 属性 + CSS 伪元素（与 novel-word-count 同款机制）。
+ * 方案2：RP 接管 ::after，读取 NWC 显示条目组合为 "RP | NWC"。
+ * NWC 的 ::after 选择器优先级为 0,3,2，RP 基础规则（0,1,1）会被
+ * 覆盖，故 NWC 启用时用 0,4,2 组合规则接管显示 */
+.nav-file-title[data-read-progress-info] {
+	align-items: baseline;
+	unicode-bidi: isolate;
+}
+/* 内容区伸展：把信息块推到右侧（与 NWC note-right 同款） */
+.nav-file-title[data-read-progress-info] .nav-file-title-content {
+	flex: 1 1 0;
+	min-width: 20px;
+	unicode-bidi: isolate;
+}
+.nav-file-title[data-read-progress-info]::after {
+	content: attr(data-read-progress-info);
+	flex: 0 0 auto;
+	font-size: 0.8em;
+	max-width: calc(100% - 20px);
+	min-width: 0;
+	opacity: var(--text-faint, 0.7);
+	order: 1;
+	overflow: hidden;
+	padding: 0 4px;
+	position: relative;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	unicode-bidi: isolate;
+	direction: ltr;
+}
+/* NWC 启用时：RP 的 ::after（0,4,2）优先级高于 NWC（0,3,2），
+ * 接管显示组合文本 "RP | NWC"（NWC 自身的 ::after 被覆盖） */
+.novel-word-count--active .nav-files-container .nav-file-title[data-read-progress-info]::after {
+	content: attr(data-read-progress-info);
+	flex: 0 0 auto;
+	order: 1;
 }
 
 /* 百分比文字：10px，灰色 */

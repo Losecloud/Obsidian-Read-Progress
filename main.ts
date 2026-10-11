@@ -19,22 +19,44 @@ interface ExplorerReadingProgressSettings {
 	barOffset: number;
 	/** 进度条两端圆角（全圆角），默认直角 */
 	rounded: boolean;
-	/** 进度达到 100% 时进度条自动变绿色 */
-	completeGreen: boolean;
+	/** 进行中填充色（空 = 系统主题色自适应） */
+	pendingColor: string;
+	/** 完成填充色（空 = 绿色） */
+	completeColor: string;
 	/** Beta：启用覆盖模型（记录真实阅读区域，分段渲染）。默认关闭 = 当前位置模式 */
 	beta: boolean;
 	/** Beta：阅读目标时长（分钟）。区域阅读时长达到该值时显示达成色，浓度按 0~目标自动适配 */
 	readGoal: number;
+	/** 记住 md 笔记上次阅读位置，再次打开时恢复（类似 PDF 内置行为） */
+	restoreMdPosition: boolean;
+	/** 信息显示类型（文件树条目右侧，data 属性 + CSS 伪元素渲染）
+	 *  1st/2nd/3rd 三个槽位，互斥（选了 A 则其他槽位排除 A） */
+	infoDisplay1: InfoType;
+	infoDisplay2: InfoType;
+	infoDisplay3: InfoType;
 }
 
+/** 信息显示类型（none = 不显示） */
+type InfoType =
+	| 'none'
+	| 'readtime'
+	| 'esttime'
+	| 'lastread'
+	| 'progress';
+
 const DEFAULT_SETTINGS: ExplorerReadingProgressSettings = {
-	barWidth: 90,
+	barWidth: 100,
 	lineWidth: 2,
-	barOffset: 5,
-	rounded: false,
-	completeGreen: true,
-	beta: false,
-	readGoal: 120,
+	barOffset: 3,
+	rounded: true,
+	pendingColor: '',
+	completeColor: '',
+	beta: true,
+	readGoal: 5,
+	restoreMdPosition: false,
+	infoDisplay1: 'none',
+	infoDisplay2: 'none',
+	infoDisplay3: 'none',
 };
 
 /**
@@ -167,6 +189,43 @@ interface ScrollInfo {
 	clientHeight: number;
 }
 
+/** Obsidian 内部 PDF 视图的 pdf.js 查看器（ObsidianViewer，未公开字段） */
+interface ObsidianPdfViewerLike {
+	/** 当前页索引（0-based） */
+	page: number;
+	/** 总页数（异步加载，打开初期为 0） */
+	pagesCount: number;
+	/** pdf.js 事件总线（pagechanging：翻页按钮/目录跳转，单页模式不触发滚动） */
+	eventBus?: {
+		on: (name: string, cb: (e: unknown) => void) => void;
+		off: (name: string, cb: (e: unknown) => void) => void;
+	};
+	/** DOM 结构（viewerContainerEl 为滚动容器，连续模式可滚动） */
+	dom?: { viewerContainerEl?: HTMLElement } | null;
+}
+
+/** PDFViewerChild：viewer 与 pdf.js 查看器之间的桥接层（异步就绪） */
+interface PdfViewerChildLike {
+	pdfViewer?: ObsidianPdfViewerLike;
+	/** 当前加载的 PDF 文件 */
+	file?: TFile | null;
+	/** child 就绪后执行回调（先于 then 注册的回调可能丢失，用轮询兜底） */
+	then?: (cb: (child: PdfViewerChildLike) => void) => void;
+}
+
+/** PDFViewerComponent：PDFView.viewer（未公开字段） */
+interface PdfViewerComponentLike {
+	/** 桥接层，加载文件后异步创建 */
+	child?: PdfViewerChildLike | null;
+	then?: (cb: (child: PdfViewerChildLike) => void) => void;
+}
+
+/** Obsidian 内部 PDF 视图（未公开类）的最小结构 */
+interface PdfViewLike {
+	file: TFile | null;
+	viewer?: PdfViewerComponentLike;
+}
+
 export default class ReadProgressPlugin extends Plugin {
 	settings: ExplorerReadingProgressSettings = DEFAULT_SETTINGS;
 
@@ -179,9 +238,17 @@ export default class ReadProgressPlugin extends Plugin {
 	/** 上一次写入的进度，用于跳过无变化的写入 */
 	private lastWritten: Map<string, string> = new Map();
 	/** 当前滚动监听的绑定信息，用于卸载时移除 */
-	private scrollBinding: { target: HTMLElement; listener: () => void; path: string } | null = null;
+	private scrollBinding: {
+		target: HTMLElement;
+		listener: () => void;
+		path: string;
+		/** PDF 视图的 pdf.js 事件总线（解绑 pagechanging） */
+		eventBus?: { off: (name: string, cb: (e: unknown) => void) => void };
+	} | null = null;
 	/** 进度数据：路径 → 覆盖模型（统一存于 data.json） */
 	private progressData: Record<string, NoteProgress> = {};
+	/** md 笔记上次阅读位置（px，滚动停止后记录，用于再次打开时恢复） */
+	private mdPositions: Record<string, number> = {};
 	/** 阅读计时状态：当前停留区域（微信读书式计时，翻页/切页时结算） */
 	private readTimer: {
 		path: string;
@@ -189,6 +256,8 @@ export default class ReadProgressPlugin extends Plugin {
 		end: number;
 		total: number;
 		credited: number;
+		/** 位置单位：md 按像素，pdf 按页 */
+		unit: 'px' | 'page';
 	} | null = null;
 	/** 最后一次键鼠操作时间戳（防 idle：5min 无操作才封顶） */
 	private lastInputTs: number = Date.now();
@@ -196,13 +265,19 @@ export default class ReadProgressPlugin extends Plugin {
 	private communityScrollTop = 0;
 	/** 设置页 DOM 监测器（社区插件列表出现时附加滚动监听） */
 	private settingObserver: MutationObserver | null = null;
+	/** NWC 属性监测器（data-novel-word-count-plugin 变化时同步刷新 RP 信息） */
+	private nwcObserver: MutationObserver | null = null;
 
 	constructor(app: App, manifest: PluginManifestLike) {
 		super(app, manifest);
 		// 300ms 防抖：滚动停止后才写入数据文件
-		this.debouncedSave = debounce((file: TFile, top: number, vh: number, total: number) => {
-			void this.writeProgress(file, top, vh, total);
-		}, 300, true);
+	this.debouncedSave = debounce(
+		(file: TFile, top: number, vh: number, total: number, unit: 'px' | 'page') => {
+			void this.writeProgress(file, top, vh, total, unit);
+		},
+		300,
+		true
+	);
 		// 150ms 防抖：合并文件树刷新，避免高频重渲染
 		this.scheduleRefresh = debounce(() => this.refreshAll(), 150, true);
 		this.schedulePathRefresh = debounce((path: string) => this.decoratePath(path), 150, true);
@@ -237,7 +312,12 @@ export default class ReadProgressPlugin extends Plugin {
 
 		// 布局变化（折叠/展开文件夹、切换仓库视图、新建拆分窗口）→ 全量刷新
 		this.registerEvent(
-			this.app.workspace.on('layout-change', () => this.scheduleRefresh())
+			this.app.workspace.on('layout-change', () => {
+				this.scheduleRefresh();
+				// NWC 在 layout-change 后防抖更新显示属性，
+				// 延迟刷新确保读到最新值（启用/禁用 NWC 时自动拼合）
+				window.setTimeout(() => this.scheduleRefresh(), 600);
+			})
 		);
 		// 主题切换 → 重渲染（进度条颜色适配亮色/暗色）
 		this.registerEvent(
@@ -260,6 +340,9 @@ export default class ReadProgressPlugin extends Plugin {
 		});
 		// 监测社区插件页滚动位置（供 Back 按钮返回时恢复）
 		this.trackCommunityPluginsScroll();
+		// 监测 NWC 显示条目变化（data-novel-word-count-plugin），
+		// 同步刷新 RP 组合信息（"RP | NWC"）
+		this.trackNwcAttributes();
 		// 焦点切出 Obsidian 窗口 → 暂停计时（不清空；聚焦后 tick 验证仍在原区域即自动恢复，无需滚动）
 		this.registerDomEvent(window, 'blur', () => {
 			this.debugLog('timer paused: window blur');
@@ -275,6 +358,70 @@ export default class ReadProgressPlugin extends Plugin {
 					this.scheduleRefresh();
 				}, d);
 			}
+			// 预填充所有 md 文件的估算阅读时长（est. time 首次直接显示真实值）
+			void this.prefillEstimates();
+		});
+	}
+
+	/** 批量预填充估算阅读时长缓存（onLayoutReady 后执行） */
+	private async prefillEstimates(): Promise<void> {
+		const files = this.app.vault.getMarkdownFiles();
+		// 分批读取，避免一次性读取大量文件阻塞
+		const batch = 20;
+		for (let i = 0; i < files.length; i += batch) {
+			const chunk = files.slice(i, i + batch);
+			await Promise.all(
+				chunk.map(async (file) => {
+					if (this.estCache.has(file.path)) return;
+					let content = '';
+					try {
+						content = await this.app.vault.read(file);
+					} catch {
+						return;
+					}
+					this.estCache.set(file.path, this.computeEstimate(content));
+				})
+			);
+			// 每批完成后刷新文件树
+			this.scheduleRefresh();
+		}
+	}
+
+	/** 估算阅读时长（分钟）：CJK 500字/分 + 英文 265词/分 */
+	private computeEstimate(content: string): number {
+		// 去除 frontmatter（--- 包裹的 YAML 头）
+		if (content.startsWith('---')) {
+			const end = content.indexOf('\n---', 3);
+			if (end !== -1) content = content.slice(end + 4);
+		}
+		// CJK 字符数（汉字/假名/谚文）
+		const cjk = (content.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu) ?? []).length;
+		// 英文词数：非 CJK 部分按空白分词
+		const nonCjk = content.replace(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu, ' ');
+		const words = (nonCjk.match(/\S+/g) ?? []).length;
+		return cjk / 500 + words / 265;
+	}
+
+	/**
+	 * 监测 NWC 显示条目属性变化。
+	 * NWC 在 layout-change 时防抖更新 data-novel-word-count-plugin，
+	 * RP 读取该值拼接组合信息；属性变化时定向刷新对应条目。
+	 */
+	private trackNwcAttributes(): void {
+		this.nwcObserver = new MutationObserver((mutations) => {
+			for (const m of mutations) {
+				if (m.type !== 'attributes') continue;
+				const titleEl = m.target as HTMLElement;
+				const path = titleEl.getAttribute('data-path');
+				if (path && (path.endsWith('.md') || path.endsWith('.pdf'))) {
+					this.schedulePathRefresh(path);
+				}
+			}
+		});
+		this.nwcObserver.observe(this.app.workspace.containerEl, {
+			attributes: true,
+			subtree: true,
+			attributeFilter: ['data-novel-word-count-plugin']
 		});
 	}
 
@@ -286,6 +433,9 @@ export default class ReadProgressPlugin extends Plugin {
 		// 断开设置页监测器
 		this.settingObserver?.disconnect();
 		this.settingObserver = null;
+		// 断开 NWC 属性监测器
+		this.nwcObserver?.disconnect();
+		this.nwcObserver = null;
 		// 清理所有装饰 DOM，无残留
 		this.cleanupDecorations();
 	}
@@ -320,12 +470,23 @@ export default class ReadProgressPlugin extends Plugin {
 
 	// ==================== 模块1：滚动进度采集 ====================
 
-	/** 给当前激活的 Markdown 视图挂载滚动监听 */
+	/** 给当前激活的正文视图挂载滚动监听（Markdown 或 PDF） */
 	private attachScrollListener() {
 		this.detachScrollListener();
 
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view) return;
+		if (view) {
+			this.attachMarkdownScroll(view);
+			return;
+		}
+		const pdfView = this.getActivePdfView();
+		if (pdfView) {
+			this.attachPdfScroll(pdfView);
+		}
+	}
+
+	/** 给当前激活的 Markdown 视图挂载滚动监听 */
+	private attachMarkdownScroll(view: MarkdownView) {
 		const file = view.file;
 		if (!file || file.extension !== 'md') return;
 
@@ -344,19 +505,142 @@ export default class ReadProgressPlugin extends Plugin {
 			const key = `${top.toFixed(1)}|${vh.toFixed(1)}|${total.toFixed(1)}`;
 			if (this.lastWritten.get(file.path) === key) return;
 			this.lastWritten.set(file.path, key);
-			this.debouncedSave(file, top, vh, total);
+			this.debouncedSave(file, top, vh, total, 'px');
 		};
 
 		scrollEl.addEventListener('scroll', listener);
 		// 挂载后立即采集一次（记录当前位置）
 		listener();
 		this.scrollBinding = { target: scrollEl, listener, path: file.path };
+
+		// 恢复上次阅读位置（开关开启且有记录时）。
+		// 用 rAF 递归轮询：视图内容一渲染完成（scrollHeight 就绪）
+		// 立即恢复，比固定延时更快，避免先闪一下顶部再跳转。
+		// 仅在仍未滚动（scrollTop=0）时恢复，避免覆盖用户手动滚动
+		if (this.settings.restoreMdPosition) {
+			const saved = this.mdPositions[file.path];
+			if (saved && saved > 0) {
+				const tryRestore = (remaining: number): void => {
+					// 已切走其他视图：放弃恢复
+					const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+					if (!active || !active.file || active.file.path !== file.path) return;
+					const el = this.getScrollTarget(view);
+					if (!el || el.scrollTop !== 0) return;
+					if (el.scrollHeight <= 0) {
+						// 尚未就绪：下一帧再试（最多 60 帧 ≈ 1s）
+						if (remaining > 0) {
+							window.requestAnimationFrame(() => tryRestore(remaining - 1));
+						}
+						return;
+					}
+					el.scrollTop = saved;
+				};
+				tryRestore(60);
+			}
+		}
+	}
+
+	/** 获取当前激活的内部 PDF 视图（未公开类，鸭子类型识别） */
+	private getActivePdfView(): PdfViewLike | null {
+		const view = (this.app.workspace.activeLeaf?.view ??
+			null) as unknown as PdfViewLike | null;
+		if (!view?.viewer) return null;
+		if (!view.file || view.file.extension !== 'pdf') return null;
+		return view;
+	}
+
+	/** 获取 PDF 视图的 pdf.js 查看器（child 异步就绪，可能为 null） */
+	private getPdfChild(): PdfViewerChildLike | null {
+		const view = this.getActivePdfView();
+		return view?.viewer?.child ?? null;
+	}
+
+	/** 给当前激活的 PDF 视图挂载阅读位置监听 */
+	private attachPdfScroll(view: PdfViewLike) {
+		const file = view.file;
+		if (!file) return;
+
+		// child 异步创建：先注册回调，轮询兜底（防时序竞争）
+		const ready = () => this.bindPdfScroll(view, file);
+		view.viewer?.then?.(ready);
+		// 轮询：child 在 then 回调注册前已就绪时，靠轮询接管
+		const poll = window.setInterval(() => {
+			if (this.scrollBinding?.path === file.path || !this.getActivePdfView()) {
+				window.clearInterval(poll);
+				return;
+			}
+			if (this.getPdfChild()) {
+				window.clearInterval(poll);
+				ready();
+			}
+		}, 250);
+		// 最多轮询 10s（PDF 长时间未加载则放弃）
+		window.setTimeout(() => window.clearInterval(poll), 10000);
+	}
+
+	/** 绑定 PDF 滚动/翻页监听（child 就绪后调用） */
+	private bindPdfScroll(view: PdfViewLike, file: TFile): void {
+		// 已绑定（或已切走）则跳过
+		if (this.scrollBinding?.path === file.path) return;
+		if (this.getActivePdfView() !== view) return;
+		const pv = this.getPdfChild()?.pdfViewer;
+		if (!pv) return;
+		// 滚动容器：连续模式为 dom.viewerContainerEl；单页模式无滚动容器（靠 pagechanging）
+		const container = pv.dom?.viewerContainerEl ?? null;
+
+		const listener = () => {
+			const pagesCount = pv.pagesCount ?? 0;
+			// PDF 尚未加载完成：不采集
+			if (!pagesCount) return;
+			// 连续滚动模式：容器可滚动，按像素位置记录（与 md 同精度，
+			// 页内滚动位置也计入进度，而非整页粒度）
+			if (container && container.scrollHeight > container.clientHeight) {
+				const top = container.scrollTop;
+				const total = container.scrollHeight;
+				const vh = container.clientHeight;
+				if (total > 0 && vh > 0) {
+					const pxKey = `${top.toFixed(1)}|${vh.toFixed(1)}|${total.toFixed(1)}`;
+					if (this.lastWritten.get(file.path) === pxKey) return;
+					this.lastWritten.set(file.path, pxKey);
+					this.debouncedSave(file, top, vh, total, 'px');
+				}
+				return;
+			}
+			// 单页模式：按页码记录（连续模式滚动也会更新 page）。
+			// pdf.js 的 page 是 1-based（首页=1），桶模型按 0-based
+			// 映射，不转换会让所有标记右移一页（短文档尤为明显）
+			const page = Math.max(0, (pv.page ?? 1) - 1);
+			// 用页码指纹跳过无变化的写入（避免频繁写盘）
+			const key = `p${page}|1|${pagesCount}`;
+			if (this.lastWritten.get(file.path) === key) return;
+			this.lastWritten.set(file.path, key);
+			this.debouncedSave(file, page, 1, pagesCount, 'page');
+		};
+
+		container?.addEventListener('scroll', listener);
+		// 翻页按钮/目录跳转/单页模式翻页不一定伴随滚动，hook pdf.js 事件兜底
+		pv.eventBus?.on('pagechanging', listener);
+		// 挂载后立即采集一次（记录当前位置）
+		listener();
+		this.scrollBinding = {
+			target: container ?? view.containerEl,
+			listener,
+			path: file.path,
+			eventBus: pv.eventBus,
+		};
 	}
 
 	/** 移除滚动监听（切换笔记时调用，同时结算阅读时长） */
 	private detachScrollListener() {
 		if (this.scrollBinding) {
-			this.scrollBinding.target.removeEventListener('scroll', this.scrollBinding.listener);
+			// 离开 md 笔记时立即记录当前位置（scroll 防抖可能未触发）
+			const binding = this.scrollBinding;
+			if (binding.path.endsWith('.md')) {
+				const top = binding.target.scrollTop;
+				if (top > 0) this.mdPositions[binding.path] = Math.round(top);
+			}
+			binding.target.removeEventListener('scroll', binding.listener);
+			binding.eventBus?.off('pagechanging', binding.listener);
 			this.scrollBinding = null;
 		}
 		// 切到其他笔记/非正文页：结算当前区域阅读时长
@@ -374,6 +658,37 @@ export default class ReadProgressPlugin extends Plugin {
 		// 实时预览：通过 editor.cm 访问 CodeMirror 6（非公开字段）
 		const cm = (view.editor as unknown as { cm?: { scrollDOM?: HTMLElement } })?.cm;
 		return cm?.scrollDOM ?? null;
+	}
+
+	/** 当前激活视图是否为指定路径的正文视图（md 或 pdf） */
+	private isActivePath(path: string, unit: 'px' | 'page'): boolean {
+		// PDF 视图：page 单位=单页模式；px 单位=连续滚动模式
+		const pdfView = this.getActivePdfView();
+		if (pdfView?.file?.path === path) {
+			if (unit === 'page') return true;
+			const container = pdfView.viewer?.child?.pdfViewer?.dom?.viewerContainerEl;
+			return !!container && container.scrollHeight > container.clientHeight;
+		}
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		return !!view && !!view.file && view.file.path === path;
+	}
+
+	/** 当前激活正文视图的阅读位置（md=scrollTop px；pdf=连续模式 scrollTop px / 单页模式 0-based 页码）；无法获取返回 null */
+	private getActivePosition(unit: 'px' | 'page'): number | null {
+		const pdfView = this.getActivePdfView();
+		if (pdfView) {
+			const pv = pdfView.viewer?.child?.pdfViewer;
+			if (unit === 'page') {
+				// pdf.js 的 page 是 1-based，转换为 0-based
+				return pv ? Math.max(0, (pv.page ?? 1) - 1) : null;
+			}
+			const container = pv?.dom?.viewerContainerEl;
+			return container ? container.scrollTop : null;
+		}
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view || !view.file) return null;
+		const scrollEl = this.getScrollTarget(view);
+		return scrollEl ? scrollEl.scrollTop : null;
 	}
 
 	/** 读取滚动信息：直接从滚动元素读取 DOM 属性（scrollTop/scrollHeight/clientHeight） */
@@ -394,24 +709,38 @@ export default class ReadProgressPlugin extends Plugin {
 		file: TFile,
 		top: number,
 		vh: number,
-		total: number
+		total: number,
+		unit: 'px' | 'page'
 	): Promise<void> {
 		if (total <= 0 || vh <= 0) return;
 		const existing = this.progressData[file.path] ?? { total, buckets: createBuckets() };
-		// 更新文档总高度
-		existing.total = Math.max(existing.total, total);
+		// 文档总高度变化（PDF 缩放 / 内容变化）：
+		// 桶按相对位置（top/total）分布，缩放只改变 total
+		// 不改变相对位置——无需重分布，仅更新 total。
+		// 阈值 5% 过滤滚动时的 total 抖动
+		const totalDelta = Math.abs(existing.total - total) / Math.max(existing.total, 1);
+		if (totalDelta > 0.05) {
+			existing.total = total;
+		} else {
+			// 滚动时 total 不变：只增不减
+			existing.total = Math.max(existing.total, total);
+		}
 		// 计算当前可见区域
 		const start = Math.max(0, top);
 		const end = Math.min(existing.total, top + vh);
 		if (this.settings.beta) {
 			// 覆盖模型：不写入 0 秒区域（只在结算时记录实际阅读时长），
 			// 滚动停止 → 结算旧区域并开始新计时
-			this.startReadTimer(file.path, start, end, existing.total);
+			this.startReadTimer(file.path, start, end, existing.total, unit);
 		} else {
 			// 当前位置模式：从顶部到当前位置
 			addToBuckets(existing.buckets, existing.total, 0, end, 1);
 		}
 		this.progressData[file.path] = existing;
+		// 记录 md 笔记当前阅读位置（供 restoreMdPosition 恢复）
+		if (file.extension === 'md' && unit === 'px') {
+			this.mdPositions[file.path] = Math.round(top);
+		}
 		await this.saveSettings();
 		// 定向刷新该条目
 		this.schedulePathRefresh(file.path);
@@ -428,13 +757,29 @@ export default class ReadProgressPlugin extends Plugin {
 	/**
 	 * 开始新区域计时。
 	 * 滚动停止（防抖）后由 writeProgress 调用。
-	 * 同一笔记同一区域（±50px）：保留已累计秒数——缓慢滚动不重置计时，
-	 * 否则秒数永远累不到目标时长，进度条不变绿。
-	 * 区域变化（>50px）：先结算旧区域，再开始新计时。
+	 * 同一笔记同一区域：md 为 ±50px（缓慢滚动不重置计时），
+	 * pdf 为同一页（页是离散单位）；否则秒数永远累不到目标时长，进度条不变绿。
+	 * 区域变化：先结算旧区域，再开始新计时。
 	 */
-	private startReadTimer(path: number | string, start: number, end: number, total: number): void {
+	private startReadTimer(
+		path: number | string,
+		start: number,
+		end: number,
+		total: number,
+		unit: 'px' | 'page'
+	): void {
 		const timer = this.readTimer;
-		if (timer && timer.path === path && Math.abs(timer.start - start) <= 50) {
+		// 同一区域判定：md 按 50px 容差（缓慢滚动不重置计时）；
+		// pdf 按页精确匹配——页是离散单位，容差会把整段翻阅的
+		// 时长全部沉淀到最后一页，先前读过的页不留痕迹
+		const sameRegion =
+			!!timer &&
+			timer.path === path &&
+			timer.unit === unit &&
+			(unit === 'page'
+				? timer.start === start
+				: Math.abs(timer.start - start) <= 50);
+		if (sameRegion && timer) {
 			// 同一区域：保留累计秒数，仅更新视口边界
 			timer.start = start;
 			timer.end = end;
@@ -443,7 +788,7 @@ export default class ReadProgressPlugin extends Plugin {
 		}
 		// 区域变化：结算旧区域，开始新计时
 		this.settleReadTimer();
-		this.readTimer = { path: path as string, start, end, total, credited: 0 };
+		this.readTimer = { path: path as string, start, end, total, credited: 0, unit };
 		this.debugLog('timer start:', this.readTimer.path, `region=${Math.round(start)}-${Math.round(end)}`);
 	}
 
@@ -487,14 +832,16 @@ export default class ReadProgressPlugin extends Plugin {
 		const modal = document.querySelector<HTMLElement>('.modal-container');
 		// 只把可见的模态框视为非正文页（隐藏的 suggest 残留在 DOM 中不应暂停计时）
 		if (modal && modal.getClientRects().length > 0) { this.debugLog('timer paused: modal open'); return; }
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view || !view.file || view.file.path !== timer.path) {
+		// 视图匹配检查（md 或 pdf）
+		if (!this.isActivePath(timer.path, timer.unit)) {
 			this.debugLog('timer paused: note switched');
 			this.settleReadTimer();
 			return;
 		}
-		const scrollEl = this.getScrollTarget(view);
-		if (scrollEl && Math.abs(scrollEl.scrollTop - timer.start) > 50) {
+		const pos = this.getActivePosition(timer.unit);
+		// 偏离阈值：md 按 50px，pdf 按 1 页（页码离散）
+		const threshold = timer.unit === 'page' ? 0 : 50;
+		if (pos !== null && Math.abs(pos - timer.start) > threshold) {
 			this.debugLog('timer paused: scrolled away from timed region');
 			return;
 		}
@@ -596,10 +943,19 @@ export default class ReadProgressPlugin extends Plugin {
 	 * 进度条按已读区域分段渲染：每个 range 一段浅色填充。
 	 */
 	private decorateDom(titleEl: HTMLElement, path: string) {
-		// 只处理 .md 文件：文件夹与其他后缀文件跳过
-		if (!path.endsWith('.md')) {
+		// 只处理 .md 与 .pdf 文件：文件夹与其他后缀文件跳过
+		if (!path.endsWith('.md') && !path.endsWith('.pdf')) {
 			this.removeDecoration(titleEl);
 			return;
+		}
+
+		// 信息显示：data 属性 + CSS 伪元素（与 novel-word-count 同款机制）。
+		// 方案2：RP 接管 ::after，读取 NWC 显示条目组合为 "RP | NWC"
+		const infoText = this.buildInfoText(path, titleEl);
+		if (!infoText) {
+			titleEl.removeAttribute('data-read-progress-info');
+		} else {
+			titleEl.setAttribute('data-read-progress-info', infoText);
 		}
 
 		const data = this.progressData[path];
@@ -647,6 +1003,8 @@ export default class ReadProgressPlugin extends Plugin {
 		container.empty();
 		// 进度条轨道（承载填充段）
 		const bar = container.createDiv({ cls: 'explorer-reading-progress-bar' });
+		const pending = this.settings.pendingColor;
+		const complete = this.settings.completeColor;
 		if (this.settings.beta && total > 0) {
 			const goal = Math.max(1, this.settings.readGoal * 60);
 			for (const [s, e, secs] of ranges) {
@@ -658,19 +1016,176 @@ export default class ReadProgressPlugin extends Plugin {
 				// 根据阅读时长自动适配浓度
 				seg.style.opacity = String(this.getOpacity(secs));
 				// 达到目标时长：显示达成进度条色
-				if (this.settings.completeGreen && secs >= goal) seg.addClass('is-complete');
+				if (secs >= goal) {
+					seg.addClass('is-complete');
+					if (complete) seg.style.backgroundColor = complete;
+				} else if (pending) {
+					seg.style.backgroundColor = pending;
+				}
 			}
 		} else {
 			// 经典模式：单段实心填充
 			const fill = bar.createDiv({ cls: 'explorer-reading-progress-fill' });
 			fill.style.width = `${percent}%`;
-			if (this.settings.completeGreen && percent >= 100) fill.addClass('is-complete');
+			if (percent >= 100) {
+				fill.addClass('is-complete');
+				if (complete) fill.style.backgroundColor = complete;
+			} else if (pending) {
+				fill.style.backgroundColor = pending;
+			}
 		}
+	}
+
+	// ==================== 信息显示（文件树条目右侧） ====================
+
+	/** 构建信息显示文本（空字符串表示不显示）
+	 *  三个槽位（1st/2nd/3rd）按序拼接，槽位间 | 分隔；
+	 *  方案2：读取 NWC 的显示条目（data-novel-word-count-plugin），
+	 *  组合为 "RP1 | RP2 | RP3 | NWC"——RP 在左、NWC 在右 */
+	private buildInfoText(path: string, titleEl: HTMLElement): string {
+		const parts: string[] = [];
+		for (const type of [
+			this.settings.infoDisplay1,
+			this.settings.infoDisplay2,
+			this.settings.infoDisplay3,
+		]) {
+			if (type === 'none') continue;
+			const text = this.formatInfoSlot(type, path);
+			if (text) parts.push(text);
+		}
+		if (parts.length === 0) return '';
+		// 读取 NWC 显示条目并拼接（仅 NWC 启用时：文件树容器带
+		// .novel-word-count--active 类；禁用时属性残留但不应显示）
+		const nwcActive = titleEl.closest(
+			'.novel-word-count--active'
+		) !== null;
+		const nwc = nwcActive
+			? titleEl.getAttribute('data-novel-word-count-plugin')
+			: null;
+		const rp = parts.join(' | ');
+		return nwc ? `${rp} | ${nwc}` : rp;
+	}
+
+	/** 渲染单个槽位的信息文本 */
+	private formatInfoSlot(type: InfoType, path: string): string {
+		switch (type) {
+			case 'readtime':
+				return this.formatReadTime(this.getReadSeconds(path));
+			case 'esttime': {
+				// 估算分钟数换算为秒，统一由 formatReadTime 处理
+				const text = this.formatReadTime(
+					Math.round(this.getEstimatedMinutes(path) * 60)
+				);
+				// 缓存未命中时异步估算，回填后刷新
+				if (text === 'unread') void this.ensureEstimated(path);
+				return text === 'unread' ? '' : text;
+			}
+			case 'lastread':
+				return this.formatLastRead(path);
+			case 'progress':
+				return this.formatGoalProgress(path);
+		}
+	}
+
+	/** 累计阅读秒数（含计时中的秒数，不落盘）
+	 *  beta：buckets 存真实秒数；普通模式：buckets 是覆盖标记，
+	 *  按覆盖比例 × 文件估算阅读时长折算已阅读时长 */
+	private getReadSeconds(path: string): number {
+		const data = this.progressData[path];
+		if (!data) return 0;
+		const timer = this.readTimer;
+		if (this.settings.beta) {
+			let seconds = 0;
+			for (const s of data.buckets) seconds += s;
+			// 计时中的秒数实时反映
+			if (timer && timer.path === path) seconds += timer.credited;
+			return seconds;
+		}
+		// 普通模式：已读区域覆盖比例 × 文件估算阅读时长
+		let covered = 0;
+		for (const v of data.buckets) covered += Math.min(1, v);
+		const ratio = Math.min(1, covered / BUCKET_COUNT);
+		return Math.round(this.getEstimatedMinutes(path) * 60 * ratio);
+	}
+
+	/** 估算阅读时长缓存（path → 分钟），异步回填 */
+	private estCache = new Map<string, number>();
+
+	/** 估算阅读时长（分钟，同步查缓存；未缓存返回 0） */
+	private getEstimatedMinutes(path: string): number {
+		return this.estCache.get(path) ?? 0;
+	}
+	private async ensureEstimated(path: string): Promise<void> {
+		if (this.estCache.has(path)) return;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return;
+		let content = '';
+		try {
+			content = await this.app.vault.read(file);
+		} catch {
+			return;
+		}
+		this.estCache.set(path, this.computeEstimate(content));
+		this.schedulePathRefresh(path);
+	}
+
+	/** 格式化阅读时长（秒输入）：未阅读 unread，不足 1 分钟 <1m */
+	private formatReadTime(seconds: number): string {
+		if (seconds <= 0) return 'unread';
+		const m = seconds / 60;
+		if (m < 1) return '<1m';
+		if (m < 60) return `${Math.round(m)}m`;
+		const h = Math.floor(m / 60);
+		const rem = Math.round(m % 60);
+		return rem === 0 ? `${h}h` : `${h}h${rem}m`;
+	}
+
+	/** 最近阅读时间：md 用 mtime，PDF 用 progressData 最近写入
+	 *  今年内 MM/DD，今年以前 YY/MM/DD */
+	private formatLastRead(path: string): string {
+		let ts = 0;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (file instanceof TFile) {
+			// mtime 是最后修改时间——对 md 而言即最后阅读/编辑时间
+			ts = file.stat.mtime;
+		}
+		if (!ts) return '';
+		const d = new Date(ts);
+		const now = new Date();
+		const mm = String(d.getMonth() + 1).padStart(2, '0');
+		const dd = String(d.getDate()).padStart(2, '0');
+		if (d.getFullYear() === now.getFullYear()) {
+			return `${mm}/${dd}`;
+		}
+		const yy = String(d.getFullYear() % 100).padStart(2, '0');
+		return `${yy}/${mm}/${dd}`;
+	}
+
+	/** 阅读进度（%）：该篇文件阅读总体进度
+	 *  普通：已读区域覆盖比例（与进度条一致）
+	 *  Beta：按 prefer time 达成比例加权——
+	 *  已达成桶权重 100%（绿色段）；未达成桶按实际阅读
+	 *  浓度 secs/prefer time 折算（蓝色段）；未达成按比例扣除 */
+	private formatGoalProgress(path: string): string {
+		if (!this.settings.beta) {
+			return `${this.getProgress(path)}%`;
+		}
+		const data = this.progressData[path];
+		if (!data) return '0%';
+		const goalSec = Math.max(1, this.settings.readGoal * 60);
+		let weight = 0;
+		for (const secs of data.buckets) {
+			if (secs >= goalSec) weight += 1;
+			else if (secs > 0) weight += secs / goalSec;
+		}
+		const pct = Math.min(100, Math.round((weight / BUCKET_COUNT) * 100));
+		return `${pct}%`;
 	}
 
 	/** 移除单个条目的装饰 DOM */
 	private removeDecoration(titleEl: HTMLElement) {
 		titleEl.querySelectorAll(':scope > .explorer-reading-progress-container').forEach((el) => el.remove());
+		titleEl.removeAttribute('data-read-progress-info');
 	}
 
 	/** 卸载时清理所有装饰 DOM */
@@ -688,10 +1203,12 @@ export default class ReadProgressPlugin extends Plugin {
 	private async loadDataAll(): Promise<{
 		settings?: Partial<ExplorerReadingProgressSettings>;
 		progress?: Record<string, NoteProgress>;
+		positions?: Record<string, number>;
 	}> {
 		const data = (await this.loadData()) as {
 			settings?: Partial<ExplorerReadingProgressSettings>;
 			progress?: Record<string, NoteProgress>;
+			positions?: Record<string, number>;
 		} | null;
 		return data ?? {};
 	}
@@ -699,6 +1216,19 @@ export default class ReadProgressPlugin extends Plugin {
 	async loadSettings() {
 		const data = await this.loadDataAll();
 		this.settings = { ...DEFAULT_SETTINGS, ...(data.settings ?? {}) };
+		// 兼容旧版单槽位 infoDisplay → 迁移到 infoDisplay1
+		const legacy = data.settings as
+			| { infoDisplay?: InfoType; completeGreen?: boolean }
+			| undefined;
+		if (legacy?.infoDisplay && this.settings.infoDisplay1 === 'none') {
+			this.settings.infoDisplay1 = legacy.infoDisplay;
+		}
+		// 兼容旧版 completeGreen 开关 → completeColor（默认绿 = 空）
+		if (legacy?.completeGreen === true && !this.settings.completeColor) {
+			this.settings.completeColor = '';
+		}
+		// md 笔记上次阅读位置
+		this.mdPositions = data.positions ?? {};
 		// 兼容旧版数据：纯百分比 / 区间模型 → 桶模型
 		this.progressData = {};
 		for (const [path, value] of Object.entries(data.progress ?? {})) {
@@ -728,6 +1258,7 @@ export default class ReadProgressPlugin extends Plugin {
 		await this.saveData({
 			settings: this.settings,
 			progress: this.progressData,
+			positions: this.mdPositions,
 		});
 	}
 
@@ -788,7 +1319,7 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 		// Time Counting Mode (Beta)：覆盖模型开关（置于顶部）
 		new Setting(containerEl)
 			.setName('Time Counting Mode (Beta)')
-			.setDesc('Track actually read regions with time: re-read areas appear denser, instead of the current cursor position.')
+			.setDesc('Track actually read regions with time: re-read areas appear denser, instead of the current cursor position. If you merely want to check the position progress of each note, please switch off this button.')
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.beta)
@@ -818,6 +1349,65 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 							}
 						})
 				);
+		}
+
+		// Restore Markdown Position：再次打开 md 时恢复上次阅读位置
+		new Setting(containerEl)
+			.setName('Restore Markdown Position')
+			.setDesc('Remember the last reading position of each markdown note and restore it when reopening (like the built-in PDF viewer).')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.restoreMdPosition)
+					.onChange(async (value) => {
+						this.plugin.settings.restoreMdPosition = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		// Info Display：文件树条目右侧信息显示（3 个槽位，互斥）
+		const infoOptions: Array<[string, string]> = [
+			['none', 'None'],
+			['readtime', 'Read Time (actual)'],
+			['esttime', 'Est. Time (by words)'],
+			['lastread', 'Last Read (date)'],
+			['progress', 'Read Progress (% of goal)'],
+		];
+		const slots: Array<[string, keyof ExplorerReadingProgressSettings]> = [
+			['1st Info Display', 'infoDisplay1'],
+			['2nd Info Display', 'infoDisplay2'],
+			['3rd Info Display', 'infoDisplay3'],
+		];
+		for (const [label, key] of slots) {
+			new Setting(containerEl)
+				.setName(label)
+				.setDesc(
+					label === '1st Info Display'
+						? 'Extra info shown at the right side of each file in the explorer (compatible with Novel word count). Slots are exclusive.'
+						: 'Additional info slot (excludes types already selected above).'
+				)
+				.addDropdown((dropdown) => {
+					const selected = new Set<InfoType>();
+					for (const [, k] of slots) {
+						const v = this.plugin.settings[k] as InfoType;
+						if (v !== 'none') selected.add(v);
+					}
+					for (const [value, label] of infoOptions) {
+						// 排除其他槽位已选类型（当前槽位保留自身值）
+						const isOtherSlot =
+							selected.has(value as InfoType) &&
+							(this.plugin.settings[key] as InfoType) !== value;
+						if (!isOtherSlot) {
+							dropdown.addOption(value, label);
+						}
+					}
+					dropdown
+						.setValue(this.plugin.settings[key] as InfoType)
+						.onChange(async (value) => {
+							this.plugin.settings[key] = value as InfoType;
+							await this.plugin.saveSettings();
+							this.plugin.settingsChanged();
+						});
+				});
 		}
 
 		new Setting(containerEl)
@@ -886,18 +1476,81 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 					})
 			);
 
+		// Pending color：进行中填充色（默认系统主题色）
 		new Setting(containerEl)
-			.setName('Green on complete')
-			.setDesc('Turn the progress bar green when reading reaches 100%.')
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.completeGreen)
+			.setName('Pending color')
+			.setDesc('Fill color while reading is in progress. Empty = system accent color.')
+			.addColorPicker((picker) =>
+				picker
+					.setValue(
+						this.plugin.settings.pendingColor ||
+							this.getDefaultAccentColor()
+					)
 					.onChange(async (value) => {
-						this.plugin.settings.completeGreen = value;
+						this.plugin.settings.pendingColor = value;
 						await this.plugin.saveSettings();
 						this.plugin.settingsChanged();
 					})
+			)
+			.addExtraButton((btn) =>
+				btn
+					.setIcon('reset')
+					.setTooltip('Reset to system accent color')
+					.onClick(async () => {
+						this.plugin.settings.pendingColor = '';
+						await this.plugin.saveSettings();
+						this.plugin.settingsChanged();
+						this.display();
+					})
 			);
+
+		// Complete color：完成填充色（默认绿色）
+		new Setting(containerEl)
+			.setName('Complete color')
+			.setDesc('Fill color when reading reaches the goal. Empty = green.')
+			.addColorPicker((picker) =>
+				picker
+					.setValue(
+						this.plugin.settings.completeColor || '#4caf50'
+					)
+					.onChange(async (value) => {
+						this.plugin.settings.completeColor = value;
+						await this.plugin.saveSettings();
+						this.plugin.settingsChanged();
+					})
+			)
+			.addExtraButton((btn) =>
+				btn
+					.setIcon('reset')
+					.setTooltip('Reset to green')
+					.onClick(async () => {
+						this.plugin.settings.completeColor = '';
+						await this.plugin.saveSettings();
+						this.plugin.settingsChanged();
+						this.display();
+					})
+			);
+	}
+
+	/** 获取系统主题强调色（#rrggbb），供 ColorPicker 初始显示
+	 *  用临时 DOM 元素计算实际颜色（CSS 变量可能是 var() 引用，
+	 *  getComputedStyle 返回原始定义而非计算值） */
+	private getDefaultAccentColor(): string {
+		const probe = document.createElement('div');
+		probe.style.cssText =
+			'position:absolute;visibility:hidden;pointer-events:none;' +
+			'color:var(--interactive-accent, var(--text-accent, var(--color-accent, #61adff)));';
+		document.body.appendChild(probe);
+		const raw = getComputedStyle(probe).color;
+		probe.remove();
+		// rgb(r, g, b) / rgba(...) → #rrggbb
+		const m = raw.match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/);
+		if (m) {
+			const hex = (n: string) =>
+				parseInt(n, 10).toString(16).padStart(2, '0');
+			return `#${hex(m[1])}${hex(m[2])}${hex(m[3])}`;
+		}
+		return '#61adff';
 	}
 }
 
