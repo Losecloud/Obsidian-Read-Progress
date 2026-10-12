@@ -127,3 +127,96 @@ body.erp-rounded .explorer-reading-progress-bar {
 .erp-note {
 	margin-bottom: 30px;
 }
+
+/* 系统滚动渲染：把阅读浓度渐变渲染到右侧系统滚动条的轨道背景内。
+ * 渐变由 JS 按当前笔记的桶模型写入 --erp-sys-scroll-grad 变量，
+ * 浓度（透明度）按阅读时长适配，达到目标时长为达成色。
+ * 线宽（--erp-sys-scroll-line-size）与位置（--erp-sys-scroll-pos）
+ * 由 JS 写入：线宽超过滚动条宽度时按完整填满背景条。
+ * body 前缀提高优先级，确保覆盖 Obsidian 默认滚动条样式 */
+body .erp-sys-scroll::-webkit-scrollbar-track {
+	background-image: var(--erp-sys-scroll-grad, none);
+	background-repeat: no-repeat;
+	background-size: var(--erp-sys-scroll-line-size, 100%) 100%;
+	background-position: var(--erp-sys-scroll-pos, left) center;
+}
+
+/* 系统滚动渲染子选项：Opacity / LineWidth / Position 横向排布
+ * 标签 + 控件内联，三组之间用 gap 分隔 */
+.erp-sys-scroll-opts {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: var(--size-2-2, 8px) var(--size-4-4, 16px);
+	margin-top: 6px;
+}
+.erp-sys-opt-label {
+	font-size: 0.85em;
+	color: var(--text-normal, var(--text-faint));
+	white-space: nowrap;
+}
+.erp-sys-opt-input {
+	font-size: 0.85em;
+	padding: 2px 6px;
+	min-width: 0;
+	width: 64px;
+}
+/* 禁用态：开关关闭时子选项整体灰色 */
+.erp-sys-scroll-opts.is-disabled {
+	opacity: var(--text-faint-opacity, 0.5);
+	pointer-events: none;
+}
+.erp-sys-scroll-opts.is-disabled .erp-sys-opt-input {
+	color: var(--text-faint);
+}
+
+/* 确认弹窗：Reset read time
+ * 居中显示，点击外部/Esc 取消 */
+.erp-reset-modal {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+.erp-reset-popup {
+	background-color: var(--background-primary, var(--color-surface-1));
+	border: 1px solid var(--background-modifier-border-hover, rgba(128, 128, 128, 0.2));
+	border-radius: var(--radius-s, 4px);
+	box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.2));
+	padding: 8px 12px;
+	min-width: 220px;
+	max-width: 300px;
+}
+.erp-reset-popup-title {
+	font-weight: 600;
+	margin-bottom: 4px;
+}
+.erp-reset-popup-desc {
+	font-size: 0.85em;
+	color: var(--text-muted, var(--text-faint));
+	margin-bottom: 10px;
+}
+.erp-reset-popup-btns {
+	display: flex;
+	flex-direction: row;
+	justify-content: flex-end;
+	gap: var(--size-2-2, 8px);
+}
+.erp-reset-popup-btns button {
+	font-size: 0.85em;
+	padding: 4px 12px;
+	border-radius: var(--radius-s, 4px);
+	border: 1px solid var(--background-modifier-border, rgba(128, 128, 128, 0.2));
+	background-color: var(--background-secondary, transparent);
+	color: var(--text-normal);
+	cursor: pointer;
+}
+.erp-reset-popup-btns button.mod-cta {
+	background-color: var(--background-modifier-error, #e64553);
+	border-color: var(--background-modifier-error, #e64553);
+	color: var(--text-on-accent, #fff);
+}
+.erp-reset-popup-btns button.mod-cta:hover {
+	filter: brightness(1.1);
+}
