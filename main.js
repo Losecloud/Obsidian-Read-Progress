@@ -234,7 +234,7 @@ function rangesToBuckets(
                               
 	                                  
 	                   
-	                    
+	             
 	                                             
 	                                                         
  
@@ -248,7 +248,7 @@ function rangesToBuckets(
 
 /** Obsidian 内部 PDF 视图（未公开类）的最小结构 */
                        
-	                   
+	             
 	                                
  
 
@@ -266,8 +266,12 @@ class ReadProgressPlugin extends Plugin {
 	/** 当前滚动监听的绑定信息，用于卸载时移除 */
 	        scrollBinding   
 		                    
-		                     
+		                              
 		             
+		                                    
+		                  
+		                            
+		                       
 		                                           
 		                                                                     
 	         = null;
@@ -308,6 +312,8 @@ class ReadProgressPlugin extends Plugin {
 	        settingObserver                          = null;
 	/** NWC 属性监测器（data-novel-word-count-plugin 变化时同步刷新 RP 信息） */
 	        nwcObserver                          = null;
+	/** 文件树 DOM 监测器（文件夹展开时即时装饰新进入的文件节点） */
+	        explorerObserver                          = null;
 
 	constructor(app     , manifest                    ) {
 		super(app, manifest);
@@ -342,6 +348,30 @@ class ReadProgressPlugin extends Plugin {
 				this.detachSystemScrollTrack();
 				this.attachSystemScrollTrack();
 			})
+		);
+		// 阅读视图切换（编辑 ↔ 阅读模式，内容页右上角 view-actions 按钮）：
+		// 模式切换不触发 active-leaf-change（仍是同一 leaf），
+		// 旧滚动监听挂在已卸载的容器上，导致阅读视图下
+		// 不记录阅读浓度、滚动条背景无浓度渲染。
+		// 点击 view-action 后视图结构重建，延迟重挂。
+		this.registerDomEvent(
+			window,
+			'click',
+			(e            ) => {
+				const el = e.target;
+				if (!(el instanceof HTMLElement)) return;
+				if (!el.closest('.view-actions .view-action')) return;
+				window.setTimeout(() => {
+					const view =
+						this.app.workspace.getActiveViewOfType(MarkdownView);
+					// 清除写入指纹：确保模式切换后立即采集一次
+					if (view?.file) this.lastWritten.delete(view.file.path);
+					this.attachScrollListener();
+					this.detachSystemScrollTrack();
+					this.attachSystemScrollTrack();
+				}, 150);
+			},
+			true
 		);
 
 		// frontmatter 变化 → 定向刷新对应条目（Files Progress 同款机制）
@@ -394,6 +424,8 @@ class ReadProgressPlugin extends Plugin {
 		// 监测 NWC 显示条目变化（data-novel-word-count-plugin），
 		// 同步刷新 RP 组合信息（"RP | NWC"）
 		this.trackNwcAttributes();
+		// 监测文件树 DOM：文件夹展开时即时渲染进度条（折叠时节点移除自动释放）
+		this.trackExplorerDom();
 		// 文件树右键菜单：Reset read time（官方 file-menu 事件）
 		this.registerEvent(
 			this.app.workspace.on('file-menu', (menu, file) => {
@@ -501,6 +533,67 @@ class ReadProgressPlugin extends Plugin {
 		});
 	}
 
+	/** 监测文件树 DOM 变化：文件夹展开时，新进入 DOM 的文件节点
+	 *  即时渲染阅读浓度进度条（无需打开同目录笔记）；
+	 *  折叠文件夹时节点从 DOM 移除，进度条随之消失（不占内存）。
+	 *  仅观察各文件树容器（变化少），避免观察整个 workspace
+	 *  导致编辑器输入也触发回调。 */
+	        trackExplorerDom()       {
+		// 待处理的文件树容器（文件夹展开时分批插入，
+		// 收集后延迟一帧统一处理，等批量 DOM 构建完成）
+		const pending                = [];
+		let scheduled = false;
+		const flush = ()       => {
+			scheduled = false;
+			const batch = pending.splice(0, pending.length);
+			for (const node of batch) {
+				const titles                = node.matches(
+					'.nav-file-title[data-path]'
+				)
+					? [node]
+					: Array.from(
+							node.querySelectorAll             (
+								'.nav-file-title[data-path]'
+					)
+				);
+				for (const titleEl of titles) {
+					// 跳过已渲染的条目（避免重复构建）
+					if (
+						titleEl.querySelector(
+							':scope > .explorer-reading-progress-container'
+					)
+					) {
+						continue;
+					}
+					const path = titleEl.getAttribute('data-path') || '';
+					if (path) this.decorateDom(titleEl, path);
+				}
+			}
+		};
+		this.explorerObserver = new MutationObserver((mutations) => {
+			for (const m of mutations) {
+				if (m.type !== 'childList') continue;
+				m.addedNodes.forEach((node) => {
+					if (!(node instanceof HTMLElement)) return;
+					pending.push(node);
+				});
+			}
+			if (!scheduled && pending.length) {
+				scheduled = true;
+				window.setTimeout(flush, 50);
+			}
+		});
+		for (const view of this.getExplorerViews()) {
+			const container = view.containerEl;
+			if (container) {
+				this.explorerObserver.observe(container, {
+					childList: true,
+					subtree: true,
+				});
+			}
+		}
+	}
+
 	onunload() {
 		// 结算阅读时长并停止滚动监听
 		this.settleReadTimer();
@@ -513,6 +606,9 @@ class ReadProgressPlugin extends Plugin {
 		// 断开 NWC 属性监测器
 		this.nwcObserver?.disconnect();
 		this.nwcObserver = null;
+		// 断开文件树 DOM 监测器
+		this.explorerObserver?.disconnect();
+		this.explorerObserver = null;
 		// 清理所有装饰 DOM，无残留
 		this.cleanupDecorations();
 	}
@@ -632,24 +728,38 @@ class ReadProgressPlugin extends Plugin {
 		const viewMode = view.getMode();
 		if (viewMode !== 'preview' && viewMode !== 'source') return;
 
-		const scrollEl = this.getScrollTarget(view);
-		if (!scrollEl) return;
-
-		const listener = () => {
-			const info = this.getScrollInfo(scrollEl);
-			if (!info) return;
-			const { top, height: total, clientHeight: vh } = info;
-			// 用区间指纹跳过无变化的写入（避免频繁写盘）
-			const key = `${top.toFixed(1)}|${vh.toFixed(1)}|${total.toFixed(1)}`;
-			if (this.lastWritten.get(file.path) === key) return;
-			this.lastWritten.set(file.path, key);
-			this.debouncedSave(file, top, vh, total, 'px');
+		// 捕获阶段挂在稳定的 leaf 容器上：编辑↔阅读模式切换会重建
+		// 内部滚动容器（且不触发 active-leaf-change），挂容器可免重挂，
+		// 并在回调中动态解析真正的滚动元素（阅读视图下
+		// previewMode.containerEl 可能不是滚动元素）
+		const container = view.containerEl;
+		const listener = (e        ) => {
+			const target = e?.target;
+			if (!(target instanceof HTMLElement)) return;
+			if (!this.isMdScroller(target, view)) return;
+			// 系统滚动渲染：滚动容器与已挂载不一致时自愈重挂
+			if (
+				this.settings.beta &&
+				this.settings.systemScrollRendering &&
+				this.sysScrollEl !== target
+			) {
+				this.mountSystemScrollTrack(target, file.path);
+			}
+			this.recordMdScroll(file, target);
 		};
-
-		scrollEl.addEventListener('scroll', listener);
+		container.addEventListener('scroll', listener, true);
 		// 挂载后立即采集一次（记录当前位置）
-		listener();
-		this.scrollBinding = { target: scrollEl, listener, path: file.path };
+		const scroller = this.getScrollTarget(view);
+		if (scroller) {
+			listener({ target: scroller }                    );
+		}
+		this.scrollBinding = {
+			target: container,
+			listener,
+			path: file.path,
+			capture: true,
+			scroller: scroller ?? undefined,
+		};
 
 		// 恢复上次阅读位置（开关开启且有记录时）。
 		// 用 rAF 递归轮询：视图内容一渲染完成（scrollHeight 就绪）
@@ -676,6 +786,27 @@ class ReadProgressPlugin extends Plugin {
 				tryRestore(60);
 			}
 		}
+	}
+
+	/** 判断元素是否为 md 正文滚动容器（阅读视图 / 实时预览） */
+	        isMdScroller(el             , view              )          {
+		if (!view.containerEl.contains(el)) return false;
+		return (
+			el.classList.contains('markdown-preview-view') ||
+			el.classList.contains('markdown-reading-view') ||
+			el.classList.contains('cm-scroller')
+		);
+	}
+
+	/** 采集一次 md 滚动位置并写入（区间指纹去重） */
+	        recordMdScroll(file       , scrollEl             )       {
+		const info = this.getScrollInfo(scrollEl);
+		if (!info) return;
+		const { top, height: total, clientHeight: vh } = info;
+		const key = `${top.toFixed(1)}|${vh.toFixed(1)}|${total.toFixed(1)}`;
+		if (this.lastWritten.get(file.path) === key) return;
+		this.lastWritten.set(file.path, key);
+		this.debouncedSave(file, top, vh, total, 'px');
 	}
 
 	/** 获取当前激活的内部 PDF 视图（未公开类，鸭子类型识别） */
@@ -774,10 +905,10 @@ class ReadProgressPlugin extends Plugin {
 			// 离开 md 笔记时立即记录当前位置（scroll 防抖可能未触发）
 			const binding = this.scrollBinding;
 			if (binding.path.endsWith('.md')) {
-				const top = binding.target.scrollTop;
+				const top = binding.scroller?.scrollTop ?? 0;
 				if (top > 0) this.mdPositions[binding.path] = Math.round(top);
 			}
-			binding.target.removeEventListener('scroll', binding.listener);
+			binding.target.removeEventListener('scroll', binding.listener, binding.capture === true);
 			binding.eventBus?.off('pagechanging', binding.listener);
 			this.scrollBinding = null;
 		}
@@ -787,15 +918,48 @@ class ReadProgressPlugin extends Plugin {
 
 	/**
 	 * 获取滚动目标元素。
-	 * 阅读视图：previewMode.containerEl；实时预览：editor.cm.scrollDOM。
+	 * 阅读视图：真正可滚动的容器（previewMode.containerEl 可能返回
+	 *   不滚动的外层容器，会导致视口被误判为整篇 → 全篇均匀染色、
+	 *   滚动条背景加错元素）；
+	 * 实时预览：editor.cm.scrollDOM。
 	 */
 	        getScrollTarget(view              )                     {
 		if (view.getMode() === 'preview') {
-			return view.previewMode?.containerEl ?? null;
+			return this.resolveReadingScroller(view);
 		}
 		// 实时预览：通过 editor.cm 访问 CodeMirror 6（非公开字段）
 		const cm = (view.editor                                                   )?.cm;
 		return cm?.scrollDOM ?? null;
+	}
+
+	/**
+	 * 解析阅读视图真正可滚动的容器。
+	 * 优先已知候选（.markdown-preview-view / .markdown-reading-view），
+	 * 校验其确可滚动（scrollHeight > clientHeight）；否则在 contentEl
+	 * 内遍历取可滚动量最大者。避免选中代码块等内嵌滚动元素。
+	 */
+	        resolveReadingScroller(view              )                     {
+		const root = view.contentEl ?? null;
+		if (!root) return view.previewMode?.containerEl ?? null;
+		let best                     = null;
+		let bestOverflow = 0;
+		const scan = (el             )       => {
+			const overflow = el.scrollHeight - el.clientHeight;
+			if (overflow > bestOverflow) {
+				bestOverflow = overflow;
+				best = el;
+			}
+		};
+		for (const sel of ['.markdown-preview-view', '.markdown-reading-view']) {
+			const el = root.querySelector             (sel);
+			if (el) {
+				scan(el);
+				if (bestOverflow > 1) return best ?? el;
+			}
+		}
+		scan(root);
+		root.querySelectorAll             ('*').forEach((el) => scan(el));
+		return best ?? view.previewMode?.containerEl ?? null;
 	}
 
 	/** 当前激活视图是否为指定路径的正文视图（md 或 pdf） */
@@ -1122,11 +1286,10 @@ class ReadProgressPlugin extends Plugin {
 
 	/** 测量系统滚动条宽度（px） */
 	        measureScrollbarWidth()         {
-		const probe = document.createElement('div');
+		const probe = document.body.createEl('div');
 		probe.style.cssText =
 			'width:100px;height:100px;overflow:scroll;' +
 			'position:absolute;visibility:hidden;';
-		document.body.appendChild(probe);
 		const w = probe.offsetWidth - probe.clientWidth;
 		probe.remove();
 		return Math.max(0, w);
@@ -1648,11 +1811,10 @@ class ReadProgressPlugin extends Plugin {
 	 *  用临时 DOM 元素计算实际颜色（CSS 变量可能是 var() 引用，
 	 *  getComputedStyle 返回原始定义而非计算值） */
 	getDefaultAccentColor()         {
-		const probe = document.createElement('div');
+		const probe = document.body.createEl('div');
 		probe.style.cssText =
 			'position:absolute;visibility:hidden;pointer-events:none;' +
 			'color:var(--interactive-accent, var(--text-accent, var(--color-accent, #61adff)));';
-		document.body.appendChild(probe);
 		const raw = getComputedStyle(probe).color;
 		probe.remove();
 		// rgb(r, g, b) / rgba(...) → #rrggbb
