@@ -249,6 +249,10 @@ body .erp-sys-scroll::-webkit-scrollbar-track {
  * 深浅模式通过主题变量自适应；2px 边框 + 5px 阴影（阴影偏右，
  * 与正文区分）。 */
 
+.erp-content-host {
+	position: relative;
+}
+
 .erp-content-sidebar {
 	position: absolute;
 	top: 0;

@@ -1,7 +1,7 @@
 {
 	"id": "read-progress",
 	"name": "Read Progress",
-	"version": "0.1.7",
+	"version": "0.1.8",
 	"minAppVersion": "1.5.0",
 	"description": "Renders a reading progress bar below each markdown note and PDF in the file explorer, and shows a hover-to-reveal content outline of the current md note.",
 	"author": "Read Progress",

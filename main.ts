@@ -740,9 +740,7 @@ export default class ReadProgressPlugin extends Plugin {
 			// 显示层级只在正文区域内，不会覆盖左侧文件目录
 			// （workspace-leaf-content）等其他 leaf
 			const host = view.contentEl ?? scroller;
-			if (host.style.position === '') {
-				host.style.position = 'relative';
-			}
+			host.addClass('erp-content-host');
 			this.contentSidebarHost = host;
 			this.contentSidebar = host.createDiv({
 				cls: 'erp-content-sidebar'
@@ -781,13 +779,9 @@ export default class ReadProgressPlugin extends Plugin {
 			}).erpOnDown = onDown;
 			this.contentSidebarHost = scroller;
 		}
-		// 重新定位（覆盖在正文内容区左侧，从左侧浮入）
+		// 重新定位（覆盖在正文内容区左侧，从左侧浮入；
+		// 定位由 .erp-content-sidebar 定义，正文容器由 .erp-content-host 定义）
 		const sidebar = this.contentSidebar;
-		sidebar.style.top = '0';
-		sidebar.style.left = '0';
-		sidebar.style.bottom = '0';
-		sidebar.style.height = '';
-		sidebar.style.maxHeight = '';
 		// 显示（新建时从左侧浮入动画：先隐藏，下一帧浮现触发过渡）
 		if (isNew) {
 			sidebar.addClass('is-hidden');
@@ -1165,7 +1159,7 @@ export default class ReadProgressPlugin extends Plugin {
 			for (const m of mutations) {
 				if (m.type !== 'childList') continue;
 				m.addedNodes.forEach((node) => {
-					if (!(node instanceof HTMLElement)) return;
+					if (!node.instanceOf(HTMLElement)) return;
 					pending.push(node);
 				});
 			}
@@ -1847,7 +1841,7 @@ export default class ReadProgressPlugin extends Plugin {
 
 	/** 测量系统滚动条宽度（px） */
 	private measureScrollbarWidth(): number {
-		const probe = document.body.createEl('div');
+		const probe = document.body.createDiv();
 		probe.style.cssText =
 			'width:100px;height:100px;overflow:scroll;' +
 			'position:absolute;visibility:hidden;';
@@ -2372,7 +2366,7 @@ export default class ReadProgressPlugin extends Plugin {
 	 *  用临时 DOM 元素计算实际颜色（CSS 变量可能是 var() 引用，
 	 *  getComputedStyle 返回原始定义而非计算值） */
 	getDefaultAccentColor(): string {
-		const probe = document.body.createEl('div');
+		const probe = document.body.createDiv();
 		probe.style.cssText =
 			'position:absolute;visibility:hidden;pointer-events:none;' +
 			'color:var(--interactive-accent, var(--text-accent, var(--color-accent, #61adff)));';
