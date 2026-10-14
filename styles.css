@@ -120,7 +120,27 @@ body.erp-rounded .explorer-reading-progress-bar {
 
 /* 设置页排版：Back 按钮下方留 gap */
 .mod-back {
+	margin-bottom: 0;
+}
+
+/* 设置页顶部操作栏：Back 居左，Star/Issues 操作组居右 */
+.erp-settings-header {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: space-between;
 	margin-bottom: 10px;
+}
+/* 右侧操作按钮组 */
+.erp-settings-actions {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	gap: 8px;
+}
+/* 操作按钮：低调的强调色描边按钮 */
+.erp-action-btn {
+	cursor: pointer;
 }
 
 /* 设置页排版：缩放说明下方留 30px，区隔上下选项 */
@@ -219,4 +239,124 @@ body .erp-sys-scroll::-webkit-scrollbar-track {
 }
 .erp-reset-popup-btns button.mod-cta:hover {
 	filter: brightness(1.1);
+}
+
+/* ==================== Show Content：悬浮目录侧边栏（Beta） ====================
+ * 悬浮笔记左侧 cm-scroller padding 区域静止 300ms 后，
+ * 从左侧动画浮入，覆盖在当前笔记区域上方；鼠标移除后向左浮出。
+ * 侧边栏挂载在正文内容容器（absolute），显示层级只在
+ * 正文区域内，不会覆盖左侧文件目录（workspace-leaf-content）。
+ * 深浅模式通过主题变量自适应；2px 边框 + 5px 阴影（阴影偏右，
+ * 与正文区分）。 */
+
+.erp-content-sidebar {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	z-index: var(--layer-popover, 30);
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	padding: 0;
+	width: min(300px, 70%);
+	/* 2px 边框 + 5px 阴影（阴影偏右，与正文区分） */
+	border: 2px solid var(--background-modifier-border-hover, rgba(128, 128, 128, 0.25));
+	box-shadow: 5px 0 5px -3px rgba(0, 0, 0, 0.1);
+	/* 深浅模式自适应背景 */
+	background-color: color-mix(in srgb, var(--background-primary, var(--color-surface-1)) 90%, transparent);
+	/* 左右浮入/浮出动画（透明度 + 水平位移）：
+	 * 显示态从左侧浮入，隐藏态向左浮出 */
+	backdrop-filter: blur(2px);
+	opacity: 1;
+	transform: translateX(0);
+	transition: opacity 240ms ease, transform 240ms ease;
+	pointer-events: auto;
+}
+/* 隐藏态：向左浮出（透明度 0 + 向左位移） */
+.erp-content-sidebar.is-hidden {
+	opacity: 0;
+	transform: translateX(-100%);
+	pointer-events: none;
+}
+
+/* 顶部标题栏：居中显示 Content */
+.erp-content-header {
+	flex: 0 0 auto;
+	padding: 8px 10px 6px;
+	text-align: center;
+	font-size: 0.85em;
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	color: var(--text-normal, var(--text-faint));
+	border-bottom: 1px solid var(--background-modifier-border, rgba(128, 128, 128, 0.15));
+}
+/* 目录主体：独立滚动，标题栏与页脚固定 */
+.erp-content-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+	padding: 6px 8px;
+}
+/* 底部页脚：20% 透明度，不起眼 */
+.erp-content-footer {
+	flex: 0 0 auto;
+	padding: 6px 10px 8px;
+	text-align: center;
+	font-size: 0.75em;
+	color: var(--text-faint, var(--text-muted));
+	opacity: 0.4;
+}
+
+/* 目录条目：结构化缩进布局 */
+.erp-content-item {
+	display: flex;
+	flex-direction: row;
+	align-items: baseline;
+	gap: var(--size-2-1, 4px);
+	padding: 3px 6px;
+	padding-left: calc(6px + var(--erp-content-indent, 0) * var(--size-4-4, 16px));
+	border-radius: var(--radius-s, 4px);
+	cursor: pointer;
+	color: var(--text-normal, var(--text-faint));
+	transition: background-color 120ms ease, color 120ms ease;
+}
+.erp-content-item:hover {
+	background-color: var(--background-modifier-hover, rgba(128, 128, 128, 0.12));
+}
+/* 当前阅读节点高亮：强调色背景 */
+.erp-content-item.is-active {
+	background-color: var(--background-modifier-active-hover, rgba(128, 128, 128, 0.18));
+	color: var(--text-accent, var(--interactive-accent));
+	font-weight: 600;
+}
+/* 标题级别标记（H1/H2/...） */
+.erp-content-mark {
+	flex: 0 0 auto;
+	font-size: 0.7em;
+	font-weight: 600;
+	opacity: var(--text-faint-opacity, 0.6);
+	color: var(--text-faint);
+}
+.erp-content-item.is-active .erp-content-mark {
+	color: var(--text-accent, var(--interactive-accent));
+	opacity: 1;
+}
+/* 标题文本 */
+.erp-content-text {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-size: 0.85em;
+	line-height: 1.4;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+/* 空目录占位 */
+.erp-content-empty {
+	padding: 8px 6px;
+	font-size: 0.85em;
+	color: var(--text-faint);
 }

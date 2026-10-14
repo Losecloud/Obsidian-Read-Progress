@@ -8,6 +8,7 @@ const {
 	Setting,
 	debounce,
 	TFile,
+	TFolder,
 } = require('obsidian');
 
 /** 设置项类型 */
@@ -37,6 +38,9 @@ const {
 	                           
 	                                                 
 	                                    
+	                                                     
+	                                 
+	                     
 	                                          
 	                           
 	                                       
@@ -67,6 +71,7 @@ const DEFAULT_SETTINGS                                  = {
 	sysScrollOpacity: 1,
 	sysScrollLineWidth: 4,
 	sysScrollPosition: 'left',
+	showContent: false,
 	restoreMdPosition: false,
 	infoDisplay1: 'none',
 	infoDisplay2: 'none',
@@ -304,8 +309,6 @@ class ReadProgressPlugin extends Plugin {
 	        windowFocused          = true;
 	/** 失焦开始时间戳（blur 事件丢失时兜底：持续失焦超时结算） */
 	        blurStartTs                = null;
-	/** 最后一次滚动时间戳（滚动期间暂停计时：滚动=翻页，不计阅读时长） */
-	        lastScrollTs         = 0;
 	/** 社区插件页滚动位置（Back 按钮返回时恢复，避免回到列表顶部） */
 	        communityScrollTop = 0;
 	/** 设置页 DOM 监测器（社区插件列表出现时附加滚动监听） */
@@ -379,6 +382,8 @@ class ReadProgressPlugin extends Plugin {
 			this.app.metadataCache.on('changed', (file) => {
 				if (file instanceof TFile && file.extension === 'md') {
 					this.schedulePathRefresh(file.path);
+					// Show Content：笔记内容变化时重解析目录
+					this.invalidateContentCache(file.path);
 				}
 			})
 		);
@@ -410,17 +415,14 @@ class ReadProgressPlugin extends Plugin {
 				this.lastInputTs = Date.now();
 			});
 		}
-		// 滚动 → 刷新滚动时间戳（滚动期间暂停计时：滚动=翻页动作，
-		// 不应累计阅读时长；滚动停止后才恢复计时）
-		this.registerDomEvent(window, 'scroll', () => {
-			this.lastScrollTs = Date.now();
-		}, true);
 		// 息屏/锁屏/切后台 → 结算当前区域（停止计时）
 		this.registerDomEvent(document, 'visibilitychange', () => {
 			if (document.hidden) this.settleReadTimer();
 		});
 		// 监测社区插件页滚动位置（供 Back 按钮返回时恢复）
 		this.trackCommunityPluginsScroll();
+		// Show Content：悬浮目录侧边栏触发监听
+		this.attachShowContent();
 		// 监测 NWC 显示条目变化（data-novel-word-count-plugin），
 		// 同步刷新 RP 组合信息（"RP | NWC"）
 		this.trackNwcAttributes();
@@ -469,6 +471,595 @@ class ReadProgressPlugin extends Plugin {
 			// 预填充所有 md 文件的估算阅读时长（est. time 首次直接显示真实值）
 			void this.prefillEstimates();
 		});
+	}
+
+	// ==================== 模块3：Show Content（悬浮目录侧边栏，Beta） =================
+
+	/** 悬浮触发区域探测深度（事件路径向上检查的层数） */
+	        static          SHOW_CONTENT_PROBE_DEPTH = 4;
+
+	/** Show Content：当前显示的目录条目（切换笔记/隐藏时清空） */
+	        contentHeadings         
+		              
+		             
+		                                
+		             
+	   = [];
+	/** Show Content：当前侧边栏对应的笔记路径 */
+	        contentPath                = null;
+	/** Show Content：侧边栏 DOM（未显示为 null） */
+	        contentSidebar                     = null;
+	/** Show Content：侧边栏挂载的滚动容器（滚动时更新高亮） */
+	        contentScroller                     = null;
+	/** Show Content：滚动监听（滚动时更新当前节点高亮） */
+	        contentScrollListener                      = null;
+	/** Show Content：侧边栏宿主容器（挂载 pointerdown 清理监听） */
+	        contentSidebarHost                     = null;
+	/** Show Content：高亮锁定（跳转期间锁定目标节点） */
+	        contentActiveLocked = false;
+	/** Show Content：锁定的高亮索引 */
+	        contentActiveLockIdx = -1;
+	/** Show Content：笔记内容缓存（path → 目录条目），避免悬浮时重复读文件 */
+	        contentCache = new Map 
+		       
+		                                                    
+	 ();
+	/** Show Content：悬浮浮现延时（静止悬浮 300ms 才浮现） */
+	        contentHoverTimer                = null;
+	/** Show Content：当前悬浮的触发位置（校验静止期间鼠标未移动） */
+	        contentHoverPos                                  = null;
+	/** Show Content：触发悬浮的正文视图与滚动容器（延时回调使用） */
+	        contentHoverCtx   
+		                   
+		                      
+	         = null;
+
+	/**
+	 * 挂载 Show Content 触发监听。
+	 * 监听整个 workspace 的 pointerover（捕获）：悬浮位置在正文视图
+	 * cm-scroller 左侧 padding 区域（非文本显示区）时浮现目录侧边栏，
+	 * 鼠标移除该区域后浮出。
+	 */
+	        attachShowContent()       {
+		this.detachShowContent();
+		if (!this.settings.showContent) return;
+		this.registerDomEvent(
+			this.app.workspace.containerEl,
+			'pointerover',
+			(e              ) => this.onShowContentHover(e),
+			true
+		);
+	}
+
+	/** 卸载 Show Content（开关关闭/插件卸载时） */
+	        detachShowContent()       {
+		this.cancelContentHoverTimer();
+		this.hideContentSidebar();
+		this.contentCache.clear();
+	}
+
+	/** 取消待执行的悬浮浮现计时（鼠标移动/移出时调用） */
+	        cancelContentHoverTimer()       {
+		if (this.contentHoverTimer !== null) {
+			window.clearTimeout(this.contentHoverTimer);
+			this.contentHoverTimer = null;
+		}
+		this.contentHoverPos = null;
+		this.contentHoverCtx = null;
+	}
+
+	/**
+	 * 悬浮检测：事件路径上的祖先链中存在「正文视图的
+	 * cm-scroller 左侧 padding 区域」时，静止悬浮 300ms
+	 * 后浮现目录侧边栏；鼠标移动或移出该区域时取消/浮出。
+	 */
+	        onShowContentHover(e              )       {
+		const path = e.composedPath();
+		let scroller                     = null;
+		const depth = Math.min(
+			path.length,
+			ReadProgressPlugin.SHOW_CONTENT_PROBE_DEPTH
+		);
+		for (let i = 0; i < depth; i++) {
+			const node = path[i];
+			if (!(node instanceof HTMLElement)) continue;
+			if (!node.classList.contains('cm-scroller')) continue;
+			if (!this.isLiveScroller(node)) continue;
+			scroller = node;
+			break;
+		}
+		if (!scroller) {
+			// 鼠标移出正文滚动容器：取消待浮现计时，侧边栏浮出
+			this.cancelContentHoverTimer();
+			if (this.contentSidebar && !this.contentSidebar.contains(e.target        )) {
+				this.hideContentSidebar();
+			}
+			return;
+		}
+		// 悬浮点须落在左侧 padding 区域（非文本显示区）：
+		// clientX 在 scroller 内、文本区起点之前
+		const rect = scroller.getBoundingClientRect();
+		if (e.clientX < rect.left || e.clientX >= rect.right) return;
+		const textX = this.getScrollerTextX(scroller);
+		if (e.clientX >= textX) return;
+		// 命中触发区域：静止悬浮 300ms 后浮现
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const path2 = view?.file?.path;
+		if (!view || !path2) return;
+		// 鼠标移动（位置变化）→ 重新计时
+		const pos = { x: e.clientX, y: e.clientY };
+		if (
+			this.contentHoverCtx?.view !== view ||
+			this.contentHoverCtx?.scroller !== scroller ||
+			this.contentHoverPos?.x !== pos.x ||
+			this.contentHoverPos?.y !== pos.y
+		) {
+			this.cancelContentHoverTimer();
+			this.contentHoverCtx = { view, scroller };
+			this.contentHoverPos = pos;
+			this.contentHoverTimer = window.setTimeout(() => {
+				this.contentHoverTimer = null;
+				this.contentHoverPos = null;
+				const ctx = this.contentHoverCtx;
+				this.contentHoverCtx = null;
+				if (!ctx) return;
+				// 300ms 后校验鼠标仍停留在触发位置（静止悬浮）
+				const r = ctx.scroller.getBoundingClientRect();
+				if (
+					pos.x < r.left ||
+					pos.x >= this.getScrollerTextX(ctx.scroller)
+				) {
+					return;
+				}
+				void this.ensureContentHeadings(ctx.view.file).then(() => {
+					this.showContentSidebar(ctx.view, ctx.scroller, path2);
+				});
+			}, 300);
+		}
+	}
+
+	/** 判断 cm-scroller 是否属于正文视图（排除侧边栏笔记摘要等嵌入式 cm） */
+	        isLiveScroller(scroller             )          {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view) return false;
+		return view.containerEl.contains(scroller);
+	}
+
+	/**
+	 * scroller 内文本显示区的左边界 x。
+	 * 阅读视图：首个行内内容元素（.markdown-line / .cm-line）的左缘；
+	 * 实时预览：CodeMirror 行容器；无内容时回退 clientLeft 内边距。
+	 */
+	        getScrollerTextX(scroller             )         {
+		const line = scroller.querySelector             (
+			'.markdown-preview-view .markdown-line, .markdown-preview-view p, .cm-line'
+		);
+		if (line) {
+			const r = line.getBoundingClientRect();
+			if (r.width > 0) return r.left;
+		}
+		return scroller.getBoundingClientRect().left + scroller.clientLeft + 24;
+	}
+
+	/**
+	 * 解析笔记的结构化目录（标题层级 + 文本 + 行号）。
+	 * 支持显式 # 标题与 Obsidian 块标题（^block-id 行的前置文本）。
+	 * 行号为原始文档行号（含 frontmatter 偏移，0-based），
+	 * 与 CodeMirror 6 的行号（1-based）差 1。
+	 * 结果按路径缓存，文件变化时失效。
+	 */
+	        async ensureContentHeadings(file       )                {
+		if (this.contentCache.has(file.path)) return;
+		let content = '';
+		try {
+			content = await this.app.vault.read(file);
+		} catch {
+			return;
+		}
+		const headings = this.parseHeadings(content);
+		this.contentCache.set(file.path, headings);
+	}
+
+	/** 从笔记内容解析目录条目（level 1~6，空文本跳过） */
+	        parseHeadings(
+		content        
+	)                                                       {
+		const headings         
+			              
+			             
+			             
+		   = [];
+		// 去除 frontmatter，记录其行数偏移（行号需加回）
+		let fmOffset = 0;
+		if (content.startsWith('---')) {
+			const end = content.indexOf('\n---', 3);
+			if (end !== -1) {
+				fmOffset =
+					content.slice(0, end + 4).split('\n').length - 1;
+				content = content.slice(end + 4);
+			}
+		}
+		const rawLines = content.split('\n');
+		for (let i = 0; i < rawLines.length; i++) {
+			const line = rawLines[i].trim();
+			if (!line) continue;
+			// ATX 标题：# ~ ######
+			const m = line.match(/^(#{1,6})\s+(.+)$/);
+			if (m) {
+				const text = m[2].trim();
+				if (text) {
+					headings.push({ level: m[1].length, text, line: i + fmOffset });
+				}
+				continue;
+			}
+			// 块标题（Obsidian）：行内 ^block-id 作为标题
+			const b = line.match(/^(.+?)\s+\^[A-Za-z0-9-]+$/);
+			if (b && b[1].trim()) {
+				headings.push({ level: 3, text: b[1].trim(), line: i + fmOffset });
+			}
+		}
+		return headings;
+	}
+
+	/** 缓存失效：当前笔记内容变化（编辑/保存）时重新解析目录 */
+	        invalidateContentCache(path        )       {
+		if (!this.contentCache.delete(path)) return;
+		// 侧边栏正在显示该笔记：异步重解析后重渲染
+		if (this.contentPath === path && this.contentSidebar) {
+			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+			const file = view?.file;
+			if (!view || !file || file.path !== path) return;
+			void this.ensureContentHeadings(file).then(() => {
+				if (this.contentPath !== path || !this.contentSidebar) return;
+				this.contentHeadings = this.contentCache.get(path) ?? [];
+				this.renderContentSidebar();
+				this.updateContentActive();
+			});
+		}
+	}
+
+	/**
+	 * 显示目录侧边栏。
+	 * 覆盖在当前笔记区域左侧，从左侧动画浮入；
+	 * 内容为已结构化布局的笔记目录，当前阅读节点高亮，
+	 * 点击任意节点跳转。
+	 */
+	        showContentSidebar(
+		view              ,
+		scroller             ,
+		path        
+	)       {
+		// 切换笔记：重建侧边栏
+		let isNew = false;
+		if (this.contentPath !== path || !this.contentSidebar) {
+			isNew = true;
+			this.hideContentSidebar();
+			this.contentPath = path;
+			this.contentHeadings = this.contentCache.get(path) ?? [];
+			// 挂到正文内容容器（不随笔记内容滚动），absolute 定位：
+			// 显示层级只在正文区域内，不会覆盖左侧文件目录
+			// （workspace-leaf-content）等其他 leaf
+			const host = view.contentEl ?? scroller;
+			if (host.style.position === '') {
+				host.style.position = 'relative';
+			}
+			this.contentSidebarHost = host;
+			this.contentSidebar = host.createDiv({
+				cls: 'erp-content-sidebar'
+			});
+			this.renderContentSidebar();
+			this.updateContentActive();
+			// 点击节点 → 跳转对应标题
+			this.contentSidebar.addEventListener('click', (ev) => {
+				const item = (ev.target               ).closest             (
+					'.erp-content-item'
+				);
+				if (!item) return;
+				const idx = Number(item.dataset.erpIdx);
+				this.scrollToHeading(view, scroller, idx);
+			});
+			// 悬浮在侧边栏上时保持显示
+			this.contentSidebar.addEventListener('pointerenter', () => {
+				this.contentSidebar?.addClass('is-hover');
+			});
+			this.contentSidebar.addEventListener('pointerleave', () => {
+				this.contentSidebar?.removeClass('is-hover');
+			});
+			// 点击空白处（非侧边栏条目）时立即收起
+			const onDown = (ev              )       => {
+				if (!this.contentSidebar) return;
+				if (this.contentSidebar.contains(ev.target        )) return;
+				this.hideContentSidebar();
+			};
+			this.contentSidebar.addEventListener('pointerdown', (ev) => {
+				ev.stopPropagation();
+			}, true);
+			scroller.addEventListener('pointerdown', onDown, true);
+			// 记录清理回调：隐藏时移除 scroller 级监听
+			(this.contentSidebar                   
+				                                       
+			 ).erpOnDown = onDown;
+			this.contentSidebarHost = scroller;
+		}
+		// 重新定位（覆盖在正文内容区左侧，从左侧浮入）
+		const sidebar = this.contentSidebar;
+		sidebar.style.top = '0';
+		sidebar.style.left = '0';
+		sidebar.style.bottom = '0';
+		sidebar.style.height = '';
+		sidebar.style.maxHeight = '';
+		// 显示（新建时从左侧浮入动画：先隐藏，下一帧浮现触发过渡）
+		if (isNew) {
+			sidebar.addClass('is-hidden');
+			window.requestAnimationFrame(() => {
+				window.requestAnimationFrame(() => {
+					sidebar.removeClass('is-hidden');
+				});
+			});
+			// 标题 DOM 可能尚未渲染完成，延迟更新高亮
+			window.setTimeout(() => this.updateContentActive(), 120);
+			window.setTimeout(() => this.updateContentActive(), 400);
+		} else {
+			sidebar.removeClass('is-hidden');
+		}
+		// 滚动时更新当前节点高亮（容器切换时重挂）
+		if (this.contentScroller !== scroller) {
+			if (this.contentScroller && this.contentScrollListener) {
+				this.contentScroller.removeEventListener(
+					'scroll',
+					this.contentScrollListener,
+					true
+				);
+			}
+			this.contentScroller = scroller;
+			this.contentScrollListener = () =>
+				this.updateContentActive();
+			scroller.addEventListener(
+				'scroll',
+				this.contentScrollListener,
+				true
+			);
+		}
+	}
+
+	/** 渲染目录条目（结构化缩进布局） */
+	        renderContentSidebar()       {
+		const sidebar = this.contentSidebar;
+		if (!sidebar) return;
+		sidebar.empty();
+		// 顶部标题栏（居中显示 Content）
+		sidebar.createDiv({ cls: 'erp-content-header', text: 'Content' });
+		// 目录主体（独立滚动，标题栏/页脚固定）
+		const body = sidebar.createDiv({ cls: 'erp-content-body' });
+		const headings = this.contentHeadings;
+		if (headings.length === 0) {
+			body.createDiv({
+				cls: 'erp-content-empty',
+				text: 'No headings'
+			});
+		} else {
+			const minLevel = Math.min(...headings.map((h) => h.level));
+			headings.forEach((h, idx) => {
+				const item = body.createDiv({
+					cls: 'erp-content-item',
+					attr: { 'data-erp-idx': String(idx) }
+				});
+				// 相对最小层级缩进（level 差 → 缩进档）
+				const indent = Math.max(0, h.level - minLevel);
+				item.style.setProperty(
+					'--erp-content-indent',
+					String(indent)
+				);
+				item.createSpan({ cls: 'erp-content-mark', text: 'H' + h.level });
+				item.createSpan({
+					cls: 'erp-content-text',
+					text: h.text
+				});
+			});
+		}
+		// 底部页脚（20% 透明度，不起眼）
+		sidebar.createDiv({
+			cls: 'erp-content-footer',
+			text: '— Read Progress —'
+		});
+	}
+
+	/** 高亮当前阅读的节点 */
+	        updateContentActive()       {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const sidebar = this.contentSidebar;
+		if (!view || !sidebar || this.contentPath !== view.file?.path) return;
+		// 跳转期间高亮锁定在目标节点（用户点击的即当前阅读节点）
+		if (this.contentActiveLocked) {
+			this.applyContentActive(sidebar, this.contentActiveLockIdx);
+			return;
+		}
+		const headings = this.contentHeadings;
+		if (headings.length === 0) return;
+		const scroller = this.getScrollTarget(view);
+		if (!scroller) return;
+		// 当前阅读行 = 视口垂直中心处（与跳转落位一致）的
+		// 源码行号。用 CM6 lineBlockAtHeight 依据真实视口布局
+		// 求解该像素位置对应的行，精确（非估算）。
+		const currentLine = this.getContentLineAt(scroller);
+		if (currentLine < 0) return;
+		let activeIdx = -1;
+		for (let i = 0; i < headings.length; i++) {
+			if (headings[i].line <= currentLine) activeIdx = i;
+			else break;
+		}
+		this.applyContentActive(sidebar, activeIdx);
+	}
+
+	/**
+	 * 取滚动容器「垂直中心」处的源码行号（0-based）。
+	 * 通过 CodeMirror 6 lineBlockAtHeight 由真实视口布局求得，
+	 * 该像素位置在视口内、有实测行高，故结果精确。
+	 * 非编辑视图（如阅读模式）或 API 不可用时返回 -1。
+	 */
+	        getContentLineAt(scroller             )         {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const cm = (
+			view?.editor                
+				      
+					        
+						                                                     
+					  
+					                                                    
+				  
+			 
+		)?.cm;
+		if (
+			!cm?.state?.doc ||
+			typeof cm.lineBlockAtHeight !== 'function'
+		) {
+			return -1;
+		}
+		try {
+			const offset = Math.min(
+				scroller.scrollTop - scroller.clientHeight * 0.15,
+				scroller.scrollHeight
+			);
+			const block = cm.lineBlockAtHeight(offset);
+			return cm.state.doc.lineAt(block.from).number - 1;
+		} catch {
+			return -1;
+		}
+	}
+
+	/** 应用高亮到指定索引的目录条目 */
+	        applyContentActive(
+		sidebar             ,
+		activeIdx        
+	)       {
+		sidebar
+			.querySelectorAll             ('.erp-content-item')
+			.forEach((el) => {
+				const idx = Number(el.dataset.erpIdx);
+				el.toggleClass('is-active', idx === activeIdx);
+			});
+	}
+
+	/** 跳转到指定标题（落位视口顶部往下 10%），并保持侧边栏显示、更新高亮 */
+	        scrollToHeading(
+		view              ,
+		scroller             ,
+		idx        
+	)       {
+		const heading = this.contentHeadings[idx];
+		if (!heading) return;
+		const editor = view.editor;
+		// 目标行（0-based 源码行号，越界钳制）
+		const target = Math.max(
+			0,
+			Math.min(heading.line, editor.lineCount() - 1)
+		);
+		try {
+			// 先用公开 API 把目标行滚动进视口（由 CodeMirror 依据
+			// 真实行高落位，不受 height map 估算偏差影响）
+			editor.scrollIntoView(
+				{
+					from: { line: target, ch: 0 },
+					to: { line: target, ch: 0 }
+				},
+				true
+			);
+		} catch {
+			/* 编辑器 API 不可用时仅更新高亮 */
+		}
+		// offset 补偿：目标行进入视口后其几何为实测值，
+		// 读取该行真实位置，把它校正到视口垂直中心处
+		// （与目录高亮落位统一）。不做任何比例估算。
+		const cm = (
+			view.editor                
+				      
+					        
+						                                               
+					  
+					                                              
+				  
+			 
+		)?.cm;
+		window.requestAnimationFrame(() => {
+			try {
+				if (
+					!cm?.state?.doc ||
+					typeof cm.lineBlockAt !== 'function'
+				) {
+					return;
+				}
+				const pos = cm.state.doc.line(target + 1).from;
+				const block = cm.lineBlockAt(pos);
+				scroller.scrollTo({
+					top: Math.max(
+						0,
+						block.top + scroller.clientHeight * 0.2
+					),
+					behavior: 'smooth'
+				});
+			} catch {
+				/* 补偿失败时保留 scrollIntoView 结果 */
+			}
+		});
+		// 滚动动画期间锁定高亮到目标节点，结束后恢复按位置计算
+		this.lockContentActive(idx);
+		window.setTimeout(() => {
+			this.unlockContentActive();
+			this.updateContentActive();
+		}, 600);
+	}
+
+	/** 锁定高亮到指定目录条目（跳转期间使用） */
+	        lockContentActive(idx        )       {
+		this.contentActiveLocked = true;
+		this.contentActiveLockIdx = idx;
+		if (this.contentSidebar) {
+			this.applyContentActive(this.contentSidebar, idx);
+		}
+	}
+
+	/** 解除高亮锁定（滚动停止后恢复按位置计算） */
+	        unlockContentActive()       {
+		this.contentActiveLocked = false;
+		this.contentActiveLockIdx = -1;
+	}
+
+	/** 隐藏目录侧边栏（鼠标移除触发区域后渐变浮出） */
+	        hideContentSidebar()       {
+		const sidebar = this.contentSidebar;
+		if (!sidebar) return;
+		this.contentSidebar = null;
+		this.contentPath = null;
+		this.contentHeadings = [];
+		// 重置高亮锁定
+		this.contentActiveLocked = false;
+		this.contentActiveLockIdx = -1;
+		// 移除滚动监听
+		if (this.contentScroller && this.contentScrollListener) {
+			this.contentScroller.removeEventListener(
+				'scroll',
+				this.contentScrollListener,
+				true
+			);
+		}
+		this.contentScroller = null;
+		this.contentScrollListener = null;
+		// 移除 scroller 级 pointerdown 监听
+		const wrapper = sidebar                   
+			                                       
+		 ;
+		if (wrapper.erpOnDown && this.contentSidebarHost) {
+			this.contentSidebarHost.removeEventListener(
+				'pointerdown',
+				wrapper.erpOnDown,
+				true
+			);
+			wrapper.erpOnDown = undefined;
+		}
+		this.contentSidebarHost = null;
+		sidebar.addClass('is-hidden');
+		// 等待浮出动画完成后移除 DOM
+		window.setTimeout(() => sidebar.remove(), 260);
 	}
 
 	/** 批量预填充估算阅读时长缓存（onLayoutReady 后执行） */
@@ -599,6 +1190,7 @@ class ReadProgressPlugin extends Plugin {
 		this.settleReadTimer();
 		this.detachScrollListener();
 		this.detachSystemScrollTrack();
+		this.detachShowContent();
 		this.debouncedSave.cancel();
 		// 断开设置页监测器
 		this.settingObserver?.disconnect();
@@ -975,24 +1567,6 @@ class ReadProgressPlugin extends Plugin {
 		return !!view && !!view.file && view.file.path === path;
 	}
 
-	/** 当前激活正文视图的阅读位置（md=scrollTop px；pdf=连续模式 scrollTop px / 单页模式 0-based 页码）；无法获取返回 null */
-	        getActivePosition(unit               )                {
-		const pdfView = this.getActivePdfView();
-		if (pdfView) {
-			const pv = pdfView.viewer?.child?.pdfViewer;
-			if (unit === 'page') {
-				// pdf.js 的 page 是 1-based，转换为 0-based
-				return pv ? Math.max(0, (pv.page ?? 1) - 1) : null;
-			}
-			const container = pv?.dom?.viewerContainerEl;
-			return container ? container.scrollTop : null;
-		}
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view || !view.file) return null;
-		const scrollEl = this.getScrollTarget(view);
-		return scrollEl ? scrollEl.scrollTop : null;
-	}
-
 	/** 读取滚动信息：直接从滚动元素读取 DOM 属性（scrollTop/scrollHeight/clientHeight） */
 	        getScrollInfo(scrollEl             )                    {
 		const total = scrollEl.scrollHeight;
@@ -1130,9 +1704,10 @@ class ReadProgressPlugin extends Plugin {
 	 *  - 息屏/锁屏/切后台（document.hidden）
 	 *  - 焦点不在 Obsidian 窗口（失焦，聚焦后自动恢复）
 	 *  - 打开可见模态框（设置页、命令面板等非正文页）
-	 *  - 快速乱翻（滚动位置偏离计时区域 > 50px）
 	 *  - 防 idle：持续 5min 无任何键鼠操作才封顶（有操作即顺延）
 	 *  - 切换到其他笔记（结算并停止计时）
+	 * 滚动（含滚轮/拖动进度条）正常计时：不排除阅读速度快
+	 * 的人群采用滚动阅读方式，滚动期间与偏离区域均不暂停。
 	 */
 	        tickReadTimer()       {
 		const timer = this.readTimer;
@@ -1173,20 +1748,6 @@ class ReadProgressPlugin extends Plugin {
 		if (!this.isActivePath(timer.path, timer.unit)) {
 			this.debugLog('timer paused: note switched');
 			this.settleReadTimer();
-			return;
-		}
-		// 滚动期间暂停计时：滚动是翻页动作，不计阅读时长。
-		// 滚动停止 800ms 后才恢复（避免缓慢滚动时 timer.start
-		// 跟着 pos 更新导致偏离检查失效、持续误累计）
-		if (Date.now() - this.lastScrollTs < 800) {
-			this.debugLog('timer paused: scrolling');
-			return;
-		}
-		const pos = this.getActivePosition(timer.unit);
-		// 偏离阈值：md 按 50px，pdf 按 1 页（页码离散）
-		const threshold = timer.unit === 'page' ? 0 : 50;
-		if (pos !== null && Math.abs(pos - timer.start) > threshold) {
-			this.debugLog('timer paused: scrolled away from timed region');
 			return;
 		}
 		// 防 idle：持续 5min 无键鼠操作才封顶（停留阅读/编辑/点击均顺延）
@@ -1847,6 +2408,12 @@ class ReadProgressPlugin extends Plugin {
 		} else {
 			this.detachSystemScrollTrack();
 		}
+		// Show Content：开关变化时挂载/卸载触发监听
+		if (this.settings.showContent) {
+			this.attachShowContent();
+		} else {
+			this.detachShowContent();
+		}
 	}
 }
 
@@ -1874,8 +2441,10 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		// 返回第三方插件目录页
-		const backBtn = containerEl.createEl('button', {
+		// 顶部操作栏：左侧 Back 返回第三方插件目录页，
+		// 右侧 Star on Github / Report Issues 跳转插件 GitHub 页面
+		const headerRow = containerEl.createDiv({ cls: 'erp-settings-header' });
+		const backBtn = headerRow.createEl('button', {
 			cls: 'mod-back',
 			text: 'Back',
 		});
@@ -1885,6 +2454,28 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 			this.app.setting.openTabById('community-plugins');
 			// DOM 渲染完成后恢复滚动位置
 			window.setTimeout(() => this.plugin.restoreCommunityPluginsScroll(), 50);
+		};
+		// 右侧操作按钮组
+		const actionsEl = headerRow.createDiv({ cls: 'erp-settings-actions' });
+		const starBtn = actionsEl.createEl('button', {
+			cls: 'erp-action-btn',
+			text: '⭐️ Star on Github',
+		});
+		starBtn.onclick = () => {
+			window.open(
+				'https://github.com/Losecloud/Obsidian-Read-Progress',
+				'_blank'
+			);
+		};
+		const issuesBtn = actionsEl.createEl('button', {
+			cls: 'erp-action-btn',
+			text: '❓ Report Issues',
+		});
+		issuesBtn.onclick = () => {
+			window.open(
+				'https://github.com/Losecloud/Obsidian-Read-Progress/issues',
+				'_blank'
+			);
 		};
 
 		// Time Counting Mode (Beta)：覆盖模型开关（置于顶部）
@@ -1995,6 +2586,20 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 			});
 			// 初始禁用状态
 			setSysOptsDisabled(!this.plugin.settings.systemScrollRendering);
+
+			// Beta 选项：Show Content（悬浮目录侧边栏）
+			new Setting(containerEl)
+				.setName('Show Content')
+				.setDesc('Hover the left padding area of the note (cm-scroller, non-text zone) to fade in a sidebar with the structured outline of the current note. The current reading heading is highlighted; click any heading to jump.')
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.showContent)
+						.onChange(async (value) => {
+							this.plugin.settings.showContent = value;
+							await this.plugin.saveSettings();
+							this.plugin.settingsChanged();
+						})
+				);
 		}
 
 		// Restore Markdown Position：再次打开 md 时恢复上次阅读位置
