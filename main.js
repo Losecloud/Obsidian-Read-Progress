@@ -3,12 +3,12 @@ const {
 	App,
 	MarkdownView,
 	MenuItem,
+	Platform,
 	Plugin,
 	PluginSettingTab,
 	Setting,
 	debounce,
 	TFile,
-	TFolder,
 } = require('obsidian');
 
 /** 设置项类型 */
@@ -73,7 +73,7 @@ const DEFAULT_SETTINGS                                  = {
 	sysScrollPosition: 'left',
 	showContent: false,
 	restoreMdPosition: false,
-	infoDisplay1: 'none',
+	infoDisplay1: 'readtime',
 	infoDisplay2: 'none',
 	infoDisplay3: 'none',
 };
@@ -257,11 +257,20 @@ function rangesToBuckets(
 	                                
  
 
+/** Excalidraw 绘图视图（第三方插件，未公开类）的最小结构 */
+                              
+	             
+	                          
+	                           
+ 
+
 class ReadProgressPlugin extends Plugin {
 	settings                                  = DEFAULT_SETTINGS;
 
 	/** 滚动事件防抖（300ms） */
 	        debouncedSave                             ;
+	/** 阅读进度落盘防抖（2s）：合并滚动/结算写盘，降低 Sync churn */
+	        persistProgress                             ;
 	/** 文件树全量刷新防抖（150ms） */
 	        scheduleRefresh                             ;
 	/** 文件树单条目定向刷新防抖（150ms） */
@@ -331,6 +340,12 @@ class ReadProgressPlugin extends Plugin {
 		// 150ms 防抖：合并文件树刷新，避免高频重渲染
 		this.scheduleRefresh = debounce(() => this.refreshAll(), 150, true);
 		this.schedulePathRefresh = debounce((path        ) => this.decoratePath(path), 150, true);
+		// 2s 防抖：合并阅读进度的磁盘写入（滚动停止 + 计时结算共用）。
+		// 进度数据已在内存（this.progressData）中即时更新，延迟落盘不影响
+		// 界面；大幅降低连续滚动时的写盘频率（Obsidian Sync 场景明显减 churn）
+		this.persistProgress = debounce(() => {
+			void this.saveSettings();
+		}, 2000, true);
 		// 150ms 防抖：滚动停止后渲染系统滚动条浓度
 		this.scheduleSysScrollRender = debounce(() => this.renderSystemScrollTrack(), 150, true);
 	}
@@ -404,6 +419,9 @@ class ReadProgressPlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on('css-change', () => this.scheduleRefresh())
 		);
+		// 窗口/面板尺寸变化 → 重新定位进度条（offsetLeft 随字体、
+		// 缩进与面板宽度变化，复测避免定位停留在旧值或 0）
+		this.registerDomEvent(window, 'resize', () => this.scheduleRefresh());
 
 		// 阅读计时心跳（每秒）
 		this.registerInterval(
@@ -1186,6 +1204,9 @@ class ReadProgressPlugin extends Plugin {
 		this.detachSystemScrollTrack();
 		this.detachShowContent();
 		this.debouncedSave.cancel();
+		// 取消防抖后补写一次，落盘未写入的进度（否则卸载会丢失最后一段）
+		this.persistProgress.cancel();
+		void this.saveSettings();
 		// 断开设置页监测器
 		this.settingObserver?.disconnect();
 		this.settingObserver = null;
@@ -1302,6 +1323,12 @@ class ReadProgressPlugin extends Plugin {
 		const pdfView = this.getActivePdfView();
 		if (pdfView) {
 			this.attachPdfScroll(pdfView);
+			return;
+		}
+		// Excalidraw 绘图：无滚动容器，按「停留时长」计入 read time
+		const exView = this.getActiveExcalidrawView();
+		if (exView?.file) {
+			this.startReadTimer(exView.file.path, 0, 1, 1, 'px');
 		}
 	}
 
@@ -1408,6 +1435,15 @@ class ReadProgressPlugin extends Plugin {
 	        getPdfChild()                            {
 		const view = this.getActivePdfView();
 		return view?.viewer?.child ?? null;
+	}
+
+	/** 获取当前激活的 Excalidraw 绘图视图（第三方插件，鸭子类型识别） */
+	        getActiveExcalidrawView()                            {
+		const view = (this.app.workspace.activeLeaf?.view ??
+			null)                                        ;
+		if (!view || typeof view.getViewType !== 'function') return null;
+		if (view.getViewType() !== 'excalidraw') return null;
+		return view.file ? view : null;
 	}
 
 	/** 给当前激活的 PDF 视图挂载阅读位置监听 */
@@ -1548,8 +1584,11 @@ class ReadProgressPlugin extends Plugin {
 		return best ?? view.previewMode?.containerEl ?? null;
 	}
 
-	/** 当前激活视图是否为指定路径的正文视图（md 或 pdf） */
+	/** 当前激活视图是否为指定路径的正文视图（md 或 pdf 或 excalidraw） */
 	        isActivePath(path        , unit               )          {
+		// Excalidraw 绘图视图：按停留时长计时
+		const exView = this.getActiveExcalidrawView();
+		if (exView?.file?.path === path) return true;
 		// PDF 视图：page 单位=单页模式；px 单位=连续滚动模式
 		const pdfView = this.getActivePdfView();
 		if (pdfView?.file?.path === path) {
@@ -1611,7 +1650,7 @@ class ReadProgressPlugin extends Plugin {
 		if (file.extension === 'md' && unit === 'px') {
 			this.mdPositions[file.path] = Math.round(top);
 		}
-		await this.saveSettings();
+		this.persistProgress();
 		// 定向刷新该条目
 		this.schedulePathRefresh(file.path);
 		// 系统滚动渲染：滚动停止后更新浓度
@@ -1686,7 +1725,7 @@ class ReadProgressPlugin extends Plugin {
 		addToBuckets(existing.buckets, existing.total, timer.start, timer.end, timer.credited, true);
 		this.progressData[timer.path] = existing;
 		this.debugLog('timer settled:', timer.path, `${timer.credited}s`);
-		void this.saveSettings();
+		this.persistProgress();
 		this.schedulePathRefresh(timer.path);
 		// 系统滚动渲染：结算后浓度变化，更新
 		this.scheduleSysScrollRender();
@@ -1730,12 +1769,14 @@ class ReadProgressPlugin extends Plugin {
 		// 未聚焦任何元素（body）= 纯阅读，继续计时
 		if (active && active !== document.body) {
 			const pdfView = this.getActivePdfView();
-			const inView = pdfView
-				? pdfView.containerEl.contains(active)
-				: (() => {
-						const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-						return view ? view.containerEl.contains(active) : false;
-					})();
+			const exView = this.getActiveExcalidrawView();
+			let inView         ;
+			if (pdfView) inView = pdfView.containerEl.contains(active);
+			else if (exView) inView = !!exView.containerEl?.contains(active);
+			else {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				inView = view ? view.containerEl.contains(active) : false;
+			}
 			if (!inView) { this.debugLog('timer paused: focus outside reading view'); return; }
 		}
 		// 视图匹配检查（md 或 pdf）
@@ -1768,6 +1809,16 @@ class ReadProgressPlugin extends Plugin {
 	// ==================== 系统滚动渲染（滚动条背景浓度） ====================
 
 	/**
+	 * 系统滚动渲染是否可用。
+	 * 依赖 ::-webkit-scrollbar-track 伪元素给系统滚动条轨道染色；移动端
+	 * （iOS/Android）滚动条为系统 overlay，不占布局、不受该伪元素影响，
+	 * 故此功能仅桌面端可用。
+	 */
+	        isSystemScrollSupported()          {
+		return !Platform.isMobile;
+	}
+
+	/**
 	 * 给当前激活的正文视图挂载系统滚动渲染。
 	 * 把阅读浓度渲染到右侧系统滚动条所在的背景条内
 	 * （::-webkit-scrollbar-track 轨道 + 动态渐变变量），
@@ -1776,6 +1827,7 @@ class ReadProgressPlugin extends Plugin {
 	 */
 	        attachSystemScrollTrack()       {
 		this.detachSystemScrollTrack();
+		if (!this.isSystemScrollSupported()) return;
 		if (!this.settings.beta || !this.settings.systemScrollRendering) return;
 
 		// md 视图：滚动容器（阅读视图 / 实时预览）
@@ -2050,6 +2102,13 @@ class ReadProgressPlugin extends Plugin {
 			titleEl.setAttribute('data-read-progress-info', infoText);
 		}
 
+		// Excalidraw 绘图文件：无阅读浓度语义，不渲染下方进度条
+		// （阅读时长仍照常计入，info 区仅保留 read time / last read）
+		if (this.isExcalidraw(path)) {
+			this.removeProgressBar(titleEl);
+			return;
+		}
+
 		const data = this.progressData[path];
 		const percent = this.getProgress(path);
 		const total = data?.total ?? 0;
@@ -2065,8 +2124,12 @@ class ReadProgressPlugin extends Plugin {
 			container = host.createDiv({ cls: 'explorer-reading-progress-container' });
 		}
 		// 跟随文件名正下方：取内容容器相对条目的水平偏移（含层级缩进）
-		const content = titleEl.querySelector             ('.nav-file-title-content');
-		container.style.left = `${content?.offsetLeft ?? 0}px`;
+		this.positionBar(container, titleEl);
+		// 布局未就绪时 offsetLeft 会读到 0（条目隐藏/批量插入尚未布局），
+		// 下一帧复测一次，避免进度条塌到最左侧
+		window.requestAnimationFrame(() => {
+			if (container?.isConnected) this.positionBar(container, titleEl);
+		});
 		// 渲染时合并当前计时中的秒数：停留期间浓度渐变实时可见（无需等结算）
 		let renderRanges = ranges;
 		const timer = this.readTimer;
@@ -2077,6 +2140,25 @@ class ReadProgressPlugin extends Plugin {
 			renderRanges = bucketsToRanges(preview, total);
 		}
 		this.renderSegments(container, renderRanges, total, percent);
+	}
+
+	/**
+	 * 定位进度条：left 取文件名内容相对条目的水平偏移（含层级缩进）。
+	 * offsetLeft 依赖布局，条目隐藏或批量插入尚未布局时会读到 0，
+	 * 导致进度条塌到最左侧。故以 offsetWidth 判断内容是否已完成
+	 * 布局：已布局则记录并采用实测值（即使为 0，如顶层条目）；
+	 * 未布局则沿用上次有效值，避免把已正确的定位覆盖成 0。
+	 */
+	        positionBar(container             , titleEl             )       {
+		const content = titleEl.querySelector             (
+			'.nav-file-title-content'
+		);
+		if (content && content.offsetWidth > 0) {
+			container.dataset.erpLeft = String(content.offsetLeft);
+			container.style.left = `${content.offsetLeft}px`;
+		} else {
+			container.style.left = `${container.dataset.erpLeft ?? '0'}px`;
+		}
 	}
 
 	/**
@@ -2160,6 +2242,14 @@ class ReadProgressPlugin extends Plugin {
 
 	/** 渲染单个槽位的信息文本 */
 	        formatInfoSlot(type          , path        )         {
+		// Excalidraw 绘图：无阅读浓度信息 → 隐藏估算时长与阅读进度，
+		// 仅保留 read time / last read（阅读时长仍正常计入）
+		if (
+			this.isExcalidraw(path) &&
+			(type === 'esttime' || type === 'progress')
+		) {
+			return '';
+		}
 		switch (type) {
 			case 'readtime':
 				return this.formatReadTime(this.getReadSeconds(path));
@@ -2186,7 +2276,9 @@ class ReadProgressPlugin extends Plugin {
 		const data = this.progressData[path];
 		if (!data) return 0;
 		const timer = this.readTimer;
-		if (this.settings.beta) {
+		// Excalidraw 绘图无阅读浓度信息：无论何种模式，read time 直接取
+		// 独立累计的 readSeconds（普通模式的覆盖率×估算对绘图无意义）
+		if (this.settings.beta || this.isExcalidraw(path)) {
 			// 独立总计时（readSeconds）：仅用于 info display 的
 			// read time，与阅读浓度（buckets）完全分离——
 			// 不同时段的阅读时长直接相加，不随滚动翻页丢失
@@ -2278,8 +2370,32 @@ class ReadProgressPlugin extends Plugin {
 
 	/** 移除单个条目的装饰 DOM */
 	        removeDecoration(titleEl             ) {
-		titleEl.querySelectorAll(':scope > .explorer-reading-progress-container').forEach((el) => el.remove());
+		this.removeProgressBar(titleEl);
 		titleEl.removeAttribute('data-read-progress-info');
+	}
+
+	/** 仅移除下方进度条容器（保留 info 显示） */
+	        removeProgressBar(titleEl             ) {
+		titleEl.querySelectorAll(':scope > .explorer-reading-progress-container').forEach((el) => el.remove());
+	}
+
+	/** 是否为 Excalidraw 绘图文件。
+	 *  含三类：.excalidraw 后缀、.excalidraw.md 后缀，以及被 Excalidraw
+	 *  插件以画板模式打开的普通 .md（frontmatter 标记 excalidraw-plugin
+	 *  或 tag excalidraw）。绘图无阅读浓度语义：不显示进度条，
+	 *  info 仅保留 read time / last read */
+	        isExcalidraw(path        )          {
+		if (path.endsWith('.excalidraw.md') || path.endsWith('.excalidraw')) {
+			return true;
+		}
+		// 普通 .md 画板：靠元数据缓存中的 frontmatter / tag 识别
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return false;
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+		if (!fm) return false;
+		if (fm['excalidraw-plugin']) return true;
+		const tags = fm.tags;
+		return Array.isArray(tags) && tags.includes('excalidraw');
 	}
 
 	/** 卸载时清理所有装饰 DOM */
@@ -2506,21 +2622,31 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 						})
 				);
 
-			// Beta 选项：系统滚动渲染
+			// Beta 选项：系统滚动渲染（仅桌面端：移动端滚动条为系统 overlay，
+			// ::-webkit-scrollbar-track 染色无效，故移动端置灰并强制显示为关）
+			const sysSupported = this.plugin.isSystemScrollSupported();
 			const sysScrollSetting = new Setting(containerEl)
 				.setName('System scroll rendering')
-				.setDesc('Render reading density into the background track of the right-side system scrollbar of the current note, so you can see which parts are read and which are unread at a glance.')
-				.addToggle((toggle) =>
+				.setDesc(
+					sysSupported
+						? 'Render reading density into the background track of the right-side system scrollbar of the current note, so you can see which parts are read and which are unread at a glance.'
+						: 'Render reading density into the background track of the right-side system scrollbar of the current note. Desktop only — mobile scrollbars are system overlays and cannot be styled.'
+				)
+				.addToggle((toggle) => {
 					toggle
-						.setValue(this.plugin.settings.systemScrollRendering)
+						.setValue(
+							sysSupported &&
+								this.plugin.settings.systemScrollRendering
+						)
 						.onChange(async (value) => {
 							this.plugin.settings.systemScrollRendering = value;
 							await this.plugin.saveSettings();
 							this.plugin.settingsChanged();
 							// 关闭时子选项灰色禁用
 							setSysOptsDisabled(!value);
-						})
-				);
+						});
+					if (!sysSupported) toggle.setDisabled(true);
+				});
 
 			// 系统滚动渲染子选项：Opacity / LineWidth / Position 横向排布
 			const sysOptsRow = sysScrollSetting.infoEl.createDiv({
@@ -2578,8 +2704,11 @@ class ExplorerReadingProgressSettingTab extends PluginSettingTab {
 				await this.plugin.saveSettings();
 				this.plugin.settingsChanged();
 			});
-			// 初始禁用状态
-			setSysOptsDisabled(!this.plugin.settings.systemScrollRendering);
+			// 初始禁用状态（移动端不支持时整体禁用）
+			setSysOptsDisabled(
+				!sysSupported ||
+					!this.plugin.settings.systemScrollRendering
+			);
 
 			// Beta 选项：Show Content（悬浮目录侧边栏）
 			new Setting(containerEl)
